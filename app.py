@@ -19,11 +19,10 @@ def load_model():
 model = load_model()
 
 # ===============================
-# Embedding functions with caching
+# Embedding cache for large corpora
 # ===============================
 EMBED_CACHE_FILE = "embeddings_cache.pkl"
 
-# Load cache if exists
 if os.path.exists(EMBED_CACHE_FILE):
     with open(EMBED_CACHE_FILE, "rb") as f:
         embed_cache = pickle.load(f)
@@ -57,7 +56,7 @@ def fluency_score(text):
 # ===============================
 # Streamlit App
 # ===============================
-st.title("EduTransAI - Translation Comparison & Scoring (Offline, Large Corpora)")
+st.title("EduTransAI - Translation Comparison & Scoring (Offline)")
 
 # --- Upload CSV ---
 uploaded_file = st.file_uploader(
@@ -71,7 +70,6 @@ if uploaded_file is not None:
     st.write("Sample data:")
     st.dataframe(df.head())
 
-    # --- Select columns ---
     source_col = st.selectbox("Select the source column", df.columns)
     translation_cols = st.multiselect(
         "Select translations to compare",
@@ -81,15 +79,12 @@ if uploaded_file is not None:
     if len(translation_cols) >= 2:
         st.write(f"Comparing translations: {translation_cols}")
 
-        # --- Precompute embeddings in batch for speed ---
+        # --- Precompute embeddings in batch ---
         all_texts = list(df[source_col].astype(str))
         for col in translation_cols:
             all_texts.extend(list(df[col].astype(str)))
-
-        # Compute embeddings in batch (ignores cache)
         st.info("Computing embeddings... (may take a while for large datasets)")
         batch_embeddings = model.encode(all_texts, show_progress_bar=True)
-        # Assign embeddings to cache
         for text, emb in zip(all_texts, batch_embeddings):
             embed_cache[text] = emb
 
@@ -99,7 +94,6 @@ if uploaded_file is not None:
             source_text = str(row[source_col])
             trans_texts = [str(row[c]) for c in translation_cols]
 
-            # --- Get embeddings from cache ---
             source_emb = embed_cache[source_text]
             embeddings = [embed_cache[t] for t in trans_texts]
 
@@ -134,7 +128,6 @@ if uploaded_file is not None:
             }
             results.append(result_row)
 
-        # --- Save cache ---
         save_cache()
 
         # --- Show results ---
@@ -151,12 +144,10 @@ if uploaded_file is not None:
             mime="text/csv"
         )
 
-        # ===============================
-        # Visual Dashboard
-        # ===============================
+        # --- Visual Dashboard ---
         st.subheader("Visual Dashboard")
 
-        # --- Accuracy Plot ---
+        # Accuracy Plot
         acc_cols = [c for c in res_df.columns if c.startswith("Accuracy_")]
         if acc_cols:
             st.write("**Accuracy Scores per Translation**")
@@ -167,7 +158,7 @@ if uploaded_file is not None:
             plt.xticks(rotation=45)
             st.pyplot(plt)
 
-        # --- Fluency Plot ---
+        # Fluency Plot
         fluency_cols = [c for c in res_df.columns if c.startswith("Fluency_")]
         if fluency_cols:
             st.write("**Fluency Scores per Translation**")
@@ -178,7 +169,7 @@ if uploaded_file is not None:
             plt.xticks(rotation=45)
             st.pyplot(plt)
 
-        # --- Style Score ---
+        # Style Plot
         if "Style_Score" in res_df.columns:
             st.write("**Style Score Across Translations**")
             plt.figure(figsize=(10, 4))
