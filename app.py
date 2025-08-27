@@ -3,49 +3,32 @@ import pandas as pd
 import numpy as np
 import difflib
 import re
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.tokenize import word_tokenize
+from sentence_transformers import SentenceTransformer
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sentence_transformers import SentenceTransformer
-import os
-import pickle
 
-# ===============================
-# Load local sentence-transformers model
-# ===============================
+st.set_page_config(page_title="EduTransAI - Translation Assessment", layout="wide")
+st.title("📊 EduTransAI - Translation Comparison & Student Assessment")
+
+# ===========================
+# Load model
+# ===========================
 @st.cache_resource
 def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 model = load_model()
 
-# ===============================
-# Embedding cache for large corpora
-# ===============================
-EMBED_CACHE_FILE = "embeddings_cache.pkl"
-
-if os.path.exists(EMBED_CACHE_FILE):
-    with open(EMBED_CACHE_FILE, "rb") as f:
-        embed_cache = pickle.load(f)
-else:
-    embed_cache = {}
-
-def get_embedding(text):
-    """Get embedding from local sentence-transformers model with caching"""
-    if text in embed_cache:
-        return embed_cache[text]
-    emb = model.encode(text)
-    embed_cache[text] = emb
-    return emb
-
-def save_cache():
-    with open(EMBED_CACHE_FILE, "wb") as f:
-        pickle.dump(embed_cache, f)
-
+# ===========================
+# Helper functions
+# ===========================
 def cosine_similarity(vec1, vec2):
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8)
 
 def fluency_score(text):
-    """Simple heuristic fluency score 1-5"""
+    """Heuristic fluency score 1-5"""
     if not text.strip():
         return 1
     penalties = len(re.findall(r'\s{2,}', text)) + len(re.findall(r'[^\w\s.,;:!?]', text))
@@ -53,130 +36,229 @@ def fluency_score(text):
     score = max(1, min(5, 5 - penalties*0.5, length/20))
     return round(score, 2)
 
-# ===============================
-# Streamlit App
-# ===============================
-st.title("EduTransAI - Translation Comparison & Scoring (Offline)")
+def enhanced_error_detection(text, reference=None, other_texts=None, embed_cache=None):
+    """
+    Returns fluency, style score, and categorized errors
+    """
+    fluency = fluency_score(text)
+    
+    style_score = 0
+    if embed_cache and embed_cache.values():
+        emb = model.encode(text)
+        all_embeddings = np.array(list(embed_cache.values()))
+        style_score = np.mean([cosine_similarity(emb, e) for e in all_embeddings])
+        style_score = round(style_score, 3)
+    
+    errors = []
+    if fluency < 3:
+        errors.append("Fluency/Grammar")
+    
+    words = text.split()
+    if len(words) < 3:
+        errors.append("Too Short")
+    elif len(words) > 50:
+        errors.append("Too Long / Style Issue")
+    
+    if reference:
+        ref_tokens = reference.split()
+        diff = list(difflib.ndiff(ref_tokens, words))
+        additions = sum(1 for d in diff if d.startswith('+ '))
+        deletions = sum(1 for d in diff if d.startswith('- '))
+        if additions > 0:
+            errors.append("Addition")
+        if deletions > 0:
+            errors.append("Deletion")
+        if cosine_similarity(model.encode(reference), model.encode(text)) < 0.7:
+            errors.append("Semantic / Meaning")
+    
+    if other_texts:
+        for other in other_texts:
+            sim = cosine_similarity(model.encode(text), model.encode(other))
+            if sim < 0.6:
+                errors.append("Style / Idiomaticity")
+    
+    return fluency, style_score, ", ".join(sorted(set(errors))) if errors else "None"
 
-# --- Upload CSV ---
-uploaded_file = st.file_uploader(
-    "Upload CSV (columns: Source, Translation1, Translation2, ...)",
-    type=["csv"]
-)
+# ===========================
+# File upload
+# ===========================
+uploaded_file = st.file_uploader("Upload CSV/Excel file (translations)", type=["csv", "xlsx", "xls"])
+if uploaded_file:
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file, encoding="utf-8", na_filter=False)
+        else:
+            df = pd.read_excel(uploaded_file, na_filter=False)
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.success("File loaded successfully!")
-    st.write("Sample data:")
-    st.dataframe(df.head())
+        df.columns = df.columns.str.strip().fillna("Unnamed")
+        df = df.fillna("")
 
-    source_col = st.selectbox("Select the source column", df.columns)
-    translation_cols = st.multiselect(
-        "Select translations to compare",
-        [c for c in df.columns if c != source_col]
-    )
+        st.subheader("Preview of Uploaded Data")
+        st.dataframe(df.head())
 
-    if len(translation_cols) >= 2:
-        st.write(f"Comparing translations: {translation_cols}")
+        # Assessment mode
+        mode = st.radio("Select assessment mode:",
+                        ["Reference-based", "Pairwise Comparison", "Standalone Student Assessment"])
 
-        # --- Precompute embeddings in batch ---
-        all_texts = list(df[source_col].astype(str))
-        for col in translation_cols:
-            all_texts.extend(list(df[col].astype(str)))
-        st.info("Computing embeddings... (may take a while for large datasets)")
-        batch_embeddings = model.encode(all_texts, show_progress_bar=True)
-        for text, emb in zip(all_texts, batch_embeddings):
-            embed_cache[text] = emb
+        source_col = None
+        translation_cols = None
 
-        results = []
+        if mode == "Reference-based":
+            source_col = st.selectbox("Reference / Source Column", df.columns)
+            translation_cols = st.multiselect("Translations / Student Submissions", [c for c in df.columns if c != source_col])
+            if not translation_cols:
+                st.warning("Select at least one translation column.")
+        else:
+            translation_cols = st.multiselect("Translations / Student Submissions", df.columns)
+            if not translation_cols:
+                st.warning("Select at least one translation column.")
 
-        for idx, row in df.iterrows():
-            source_text = str(row[source_col])
-            trans_texts = [str(row[c]) for c in translation_cols]
+        if translation_cols and st.button("Run Analysis"):
+            st.subheader("✅ Analysis Results")
+            smoothie = SmoothingFunction().method4
+            results = []
 
-            source_emb = embed_cache[source_text]
-            embeddings = [embed_cache[t] for t in trans_texts]
+            # Precompute embeddings
+            all_texts = []
+            for t_col in translation_cols:
+                all_texts.extend(df[t_col].astype(str))
+            embeddings = model.encode(all_texts, show_progress_bar=True)
+            embed_cache = {text: emb for text, emb in zip(all_texts, embeddings)}
 
-            # --- Accuracy ---
-            accuracies = [cosine_similarity(source_emb, e) for e in embeddings]
+            for idx, row in df.iterrows():
+                row_result = {}
+                if source_col:
+                    source_text = str(row[source_col])
+                    source_emb = model.encode(source_text)
+                    row_result["Source"] = source_text
+                for t_col in translation_cols:
+                    trans_text = str(row[t_col])
+                    trans_emb = embed_cache[trans_text]
 
-            # --- Style similarity ---
-            style_sims = []
-            for i in range(len(embeddings)):
-                for j in range(i + 1, len(embeddings)):
-                    style_sims.append(cosine_similarity(embeddings[i], embeddings[j]))
-            style_score = np.mean(style_sims) if style_sims else 0
+                    if mode == "Reference-based":
+                        bleu = sentence_bleu([word_tokenize(str(row[source_col]))],
+                                             word_tokenize(trans_text),
+                                             smoothing_function=smoothie)
+                        fluency, style_score, error_str = enhanced_error_detection(trans_text,
+                                                                                  reference=str(row[source_col]),
+                                                                                  embed_cache=embed_cache)
+                        seq = difflib.ndiff(str(row[source_col]).split(), trans_text.split())
+                        diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
+                        row_result[f"{t_col}_BLEU"] = round(bleu,3)
+                        row_result[f"{t_col}_Fluency"] = fluency
+                        row_result[f"{t_col}_Style"] = style_score
+                        row_result[f"{t_col}_Diff"] = diff
+                        row_result[f"{t_col}_Errors"] = error_str
 
-            # --- Fluency ---
-            fluency_scores = [fluency_score(t) for t in trans_texts]
+                    elif mode == "Pairwise Comparison":
+                        for other_col in translation_cols:
+                            if other_col == t_col:
+                                continue
+                            other_text = str(row[other_col])
+                            other_emb = embed_cache[other_text]
+                            bleu = sentence_bleu([other_text.split()], trans_text.split(), smoothing_function=smoothie)
+                            fluency, style_score, error_str = enhanced_error_detection(trans_text,
+                                                                                      other_texts=[other_text],
+                                                                                      embed_cache=embed_cache)
+                            seq = difflib.ndiff(other_text.split(), trans_text.split())
+                            diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
+                            row_result[f"{t_col}_vs_{other_col}_BLEU"] = round(bleu,3)
+                            row_result[f"{t_col}_vs_{other_col}_Style"] = style_score
+                            row_result[f"{t_col}_vs_{other_col}_Diff"] = diff
+                            row_result[f"{t_col}_vs_{other_col}_Errors"] = error_str
 
-            # --- Diff highlighting ---
-            diffs = []
-            for t in trans_texts:
-                seq = difflib.ndiff(source_text.split(), t.split())
-                diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
-                diffs.append(diff)
+                    elif mode == "Standalone Student Assessment":
+                        fluency, style_score, error_str = enhanced_error_detection(trans_text,
+                                                                                  embed_cache=embed_cache)
+                        row_result[f"{t_col}_Fluency"] = fluency
+                        row_result[f"{t_col}_Style"] = style_score
+                        row_result[f"{t_col}_Errors"] = error_str
 
-            # --- Store results ---
-            result_row = {
-                "Source": source_text,
-                "Style_Score": round(style_score, 2),
-                **{f"Translation_{i+1}": t for i, t in enumerate(trans_texts)},
-                **{f"Accuracy_{i+1}": round(acc, 2) for i, acc in enumerate(accuracies)},
-                **{f"Fluency_{i+1}": f for i, f in enumerate(fluency_scores)},
-                **{f"Diff_{i+1}": d for i, d in enumerate(diffs)}
-            }
-            results.append(result_row)
+                results.append(row_result)
 
-        save_cache()
+            res_df = pd.DataFrame(results)
+            st.dataframe(res_df.head(20))
 
-        # --- Show results ---
-        res_df = pd.DataFrame(results)
-        st.subheader("Comparison Results with Scoring")
-        st.dataframe(res_df)
+            # -------------------------
+            # Low-Quality Flagging
+            # -------------------------
+            st.subheader("⚠️ Low-Quality Translation Flags")
+            flagged_cols = []
 
-        # --- Export results ---
-        csv = res_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download results as CSV",
-            data=csv,
-            file_name="translation_comparison_results.csv",
-            mime="text/csv"
-        )
+            for col in res_df.columns:
+                if col.endswith("_Fluency"):
+                    flag_col = col.replace("_Fluency", "_Low_Fluency_Flag")
+                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 3 else "")
+                    flagged_cols.append(flag_col)
+                elif col.endswith("_Style"):
+                    flag_col = col.replace("_Style", "_Low_Style_Flag")
+                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 0.5 else "")
+                    flagged_cols.append(flag_col)
+                elif col.endswith("_BLEU"):
+                    flag_col = col.replace("_BLEU", "_Low_BLEU_Flag")
+                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 0.5 else "")
+                    flagged_cols.append(flag_col)
 
-        # --- Visual Dashboard ---
-        st.subheader("Visual Dashboard")
+            if flagged_cols:
+                st.dataframe(res_df[flagged_cols].head(20))
 
-        # Accuracy Plot
-        acc_cols = [c for c in res_df.columns if c.startswith("Accuracy_")]
-        if acc_cols:
-            st.write("**Accuracy Scores per Translation**")
-            acc_df = res_df[acc_cols]
-            plt.figure(figsize=(10, 4))
-            sns.boxplot(data=acc_df)
-            plt.ylabel("Cosine Similarity")
-            plt.xticks(rotation=45)
-            st.pyplot(plt)
+            # -------------------------
+            # Dashboard
+            # -------------------------
+            st.subheader("📊 Dashboard")
+            metrics = []
+            if mode == "Reference-based":
+                metrics = ["BLEU", "Fluency", "Style"]
+            elif mode == "Pairwise Comparison":
+                metrics = ["BLEU", "Style"]
+            elif mode == "Standalone Student Assessment":
+                metrics = ["Fluency", "Style"]
 
-        # Fluency Plot
-        fluency_cols = [c for c in res_df.columns if c.startswith("Fluency_")]
-        if fluency_cols:
-            st.write("**Fluency Scores per Translation**")
-            flu_df = res_df[fluency_cols]
-            plt.figure(figsize=(10, 4))
-            sns.boxplot(data=flu_df)
-            plt.ylabel("Fluency Score (1-5)")
-            plt.xticks(rotation=45)
-            st.pyplot(plt)
+            for metric in metrics:
+                plt.figure(figsize=(10, 4))
+                metric_cols = [c for c in res_df.columns if c.endswith(metric)]
+                if metric_cols:
+                    sns.boxplot(data=res_df[metric_cols])
+                    plt.ylabel(metric)
+                    plt.title(f"{metric} per Translation / Student")
+                    st.pyplot(plt)
 
-        # Style Plot
-        if "Style_Score" in res_df.columns:
-            st.write("**Style Score Across Translations**")
-            plt.figure(figsize=(10, 4))
-            sns.barplot(x=res_df.index, y=res_df["Style_Score"])
-            plt.ylabel("Average Style Similarity")
-            plt.xlabel("Sentence Index")
-            st.pyplot(plt)
+            # -------------------------
+            # Error Categories Summary
+            # -------------------------
+            st.subheader("📌 Error Categories Summary")
+            error_cols = [c for c in res_df.columns if c.endswith("Errors")]
+            if error_cols:
+                error_counts = {}
+                for col in error_cols:
+                    col_errors = res_df[col].apply(lambda x: str(x).split(", ") if x != "None" else [])
+                    counts = {}
+                    for errors_list in col_errors:
+                        for e in errors_list:
+                            counts[e] = counts.get(e, 0) + 1
+                    error_counts[col] = counts
 
-    else:
-        st.warning("Please select at least 2 translations to compare.")
+                all_errors = set(e for counts in error_counts.values() for e in counts)
+                plot_df = pd.DataFrame(0, index=error_cols, columns=sorted(all_errors))
+                for col in error_cols:
+                    for e, cnt in error_counts[col].items():
+                        plot_df.loc[col, e] = cnt
+
+                plot_df.plot(kind="bar", stacked=True, figsize=(12,6), colormap="tab20")
+                plt.ylabel("Number of Sentences")
+                plt.xlabel("Translation / Student")
+                plt.title("Distribution of Error Categories per Translation / Student")
+                plt.xticks(rotation=45)
+                plt.legend(title="Error Category", bbox_to_anchor=(1.05, 1), loc='upper left')
+                st.pyplot(plt)
+
+            # -------------------------
+            # Download CSV
+            # -------------------------
+            csv = res_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button("Download Full Analysis Results", csv, "translation_analysis_results.csv", "text/csv")
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+else:
+    st.info("Upload CSV or Excel file to begin analysis.")
