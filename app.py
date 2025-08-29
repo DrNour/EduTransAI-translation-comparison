@@ -14,7 +14,7 @@ from docx import Document
 # Streamlit page config
 # ===========================
 st.set_page_config(page_title="EduTransAI - Translation Assessment", layout="wide")
-st.title("📊 EduTransAI - Translation Comparison & Student/MT Assessment")
+st.title("📊 EduTransAI - Translation Comparison & Student Assessment")
 
 # ===========================
 # Load model
@@ -86,6 +86,9 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     try:
+        # ---------------------------
+        # Read file content
+        # ---------------------------
         if uploaded_file.name.endswith(".csv"):
             df = pd.read_csv(uploaded_file, encoding="utf-8", na_filter=False)
         elif uploaded_file.name.endswith((".xlsx", ".xls")):
@@ -112,7 +115,7 @@ if uploaded_file:
         translation_cols = None
         if mode == "Reference-based" and len(df.columns) > 1:
             source_col = st.selectbox("Reference / Source Column", df.columns)
-            translation_cols = st.multiselect("Translations / MT Outputs", [c for c in df.columns if c != source_col])
+            translation_cols = st.multiselect("Translations / Student Submissions", [c for c in df.columns if c != source_col])
             if not translation_cols:
                 st.warning("Select at least one translation column.")
         else:
@@ -126,7 +129,7 @@ if uploaded_file:
             results = []
 
             # ---------------------------
-            # Precompute embeddings
+            # Precompute embeddings in batch
             # ---------------------------
             all_texts = list(set(df[translation_cols].astype(str).values.ravel()))
             if source_col:
@@ -140,7 +143,6 @@ if uploaded_file:
             # ---------------------------
             for idx, row in df.iterrows():
                 row_result = {}
-                bleu_scores = {}
                 for t_col in translation_cols:
                     trans_text = str(row[t_col])
                     if source_col and mode == "Reference-based":
@@ -164,7 +166,25 @@ if uploaded_file:
                             f"{t_col}_Diff": diff,
                             f"{t_col}_Errors": error_str
                         })
-                        bleu_scores[t_col] = bleu
+                    elif mode == "Pairwise Comparison":
+                        for other_col in translation_cols:
+                            if other_col == t_col:
+                                continue
+                            other_text = str(row[other_col])
+                            bleu = sentence_bleu([simple_tokenize(other_text)], simple_tokenize(trans_text), smoothing_function=smoothie)
+                            fluency, style_score, error_str = enhanced_error_detection(
+                                trans_text,
+                                other_texts=[other_text],
+                                embed_cache=embed_cache
+                            )
+                            seq = difflib.ndiff(other_text.split(), trans_text.split())
+                            diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
+                            row_result.update({
+                                f"{t_col}_vs_{other_col}_BLEU": round(bleu,3),
+                                f"{t_col}_vs_{other_col}_Style": style_score,
+                                f"{t_col}_vs_{other_col}_Diff": diff,
+                                f"{t_col}_vs_{other_col}_Errors": error_str
+                            })
                     elif mode == "Standalone Student Assessment":
                         fluency, style_score, error_str = enhanced_error_detection(
                             trans_text,
@@ -175,13 +195,18 @@ if uploaded_file:
                             f"{t_col}_Style": style_score,
                             f"{t_col}_Errors": error_str
                         })
-                # Ranking for best translation per sentence
-                if source_col and bleu_scores:
-                    sorted_bleu = sorted(bleu_scores.items(), key=lambda x: x[1], reverse=True)
-                    row_result['Best_Translation'] = sorted_bleu[0][0]
                 results.append(row_result)
 
             res_df = pd.DataFrame(results)
+
+            # ---------------------------
+            # Identify Best Translation per sentence
+            # ---------------------------
+            if mode == "Reference-based":
+                bleu_cols = [c for c in res_df.columns if c.endswith("_BLEU")]
+                res_df["Best_Translation"] = res_df[bleu_cols].idxmax(axis=1)
+                res_df["Best_Translation"] = res_df["Best_Translation"].str.replace("_BLEU","")
+
             st.dataframe(res_df.head(20))
 
             # ---------------------------
@@ -206,12 +231,27 @@ if uploaded_file:
                 st.dataframe(res_df[flagged_cols].head(20))
 
             # ---------------------------
-            # Dashboard
+            # BLEU Heatmap
+            # ---------------------------
+            if mode == "Reference-based":
+                st.subheader("📈 Per-Sentence BLEU Heatmap")
+                bleu_df = res_df[bleu_cols]
+                plt.figure(figsize=(12, len(res_df)*0.3 + 2))
+                sns.heatmap(bleu_df, annot=True, fmt=".2f", cmap="YlGnBu", cbar_kws={'label':'BLEU Score'})
+                plt.ylabel("Sentence Index")
+                plt.xlabel("Translation / Student")
+                plt.title("BLEU Score per Sentence")
+                st.pyplot(plt)
+
+            # ---------------------------
+            # Dashboard Metrics
             # ---------------------------
             st.subheader("📊 Dashboard")
             metrics = []
             if mode == "Reference-based":
                 metrics = ["BLEU", "Fluency", "Style"]
+            elif mode == "Pairwise Comparison":
+                metrics = ["BLEU", "Style"]
             elif mode == "Standalone Student Assessment":
                 metrics = ["Fluency", "Style"]
             for metric in metrics:
@@ -224,30 +264,32 @@ if uploaded_file:
                     st.pyplot(plt)
 
             # ---------------------------
-            # Average Scores per Translation / MT system
+            # Error Categories Summary
             # ---------------------------
-            st.subheader("📈 Average Scores per Translation / MT system")
-            avg_data = {}
-            for metric in metrics:
-                metric_cols = [c for c in res_df.columns if c.endswith(metric)]
-                if metric_cols:
-                    avg_data[metric] = res_df[metric_cols].mean().round(3)
+            st.subheader("📌 Error Categories Summary")
+            error_cols = [c for c in res_df.columns if c.endswith("Errors")]
+            if error_cols:
+                error_counts = {}
+                for col in error_cols:
+                    col_errors = res_df[col].apply(lambda x: str(x).split(", ") if x != "None" else [])
+                    counts = {}
+                    for errors_list in col_errors:
+                        for e in errors_list:
+                            counts[e] = counts.get(e, 0) + 1
+                    error_counts[col] = counts
 
-            if avg_data:
-                avg_df = pd.DataFrame(avg_data)
-                st.dataframe(avg_df.T)
-
-            # ---------------------------
-            # Average Ranking per MT
-            # ---------------------------
-            if source_col:
-                st.subheader("🏆 Average Ranking per MT System (by BLEU)")
-                rank_df = pd.DataFrame(index=res_df.index)
-                bleu_cols = [c for c in res_df.columns if c.endswith("_BLEU")]
-                for i, col in enumerate(bleu_cols):
-                    rank_df[col.replace("_BLEU","")] = res_df[bleu_cols].rank(axis=1, method='max', ascending=False)[col]
-                avg_rank = rank_df.mean().sort_values()
-                st.dataframe(avg_rank)
+                all_errors = set(e for counts in error_counts.values() for e in counts)
+                plot_df = pd.DataFrame(0, index=error_cols, columns=sorted(all_errors))
+                for col in error_cols:
+                    for e, cnt in error_counts[col].items():
+                        plot_df.loc[col, e] = cnt
+                plot_df.plot(kind="bar", stacked=True, figsize=(12,6), colormap="tab20")
+                plt.ylabel("Number of Sentences")
+                plt.xlabel("Translation / Student")
+                plt.title("Distribution of Error Categories per Translation / Student")
+                plt.xticks(rotation=45)
+                plt.legend(title="Error Category", bbox_to_anchor=(1.05, 1), loc='upper left')
+                st.pyplot(plt)
 
             # ---------------------------
             # Download CSV
