@@ -1,49 +1,89 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from docx import Document
-from io import BytesIO
+import io
 
-st.title("Translation Alignment Tool (19 IDs)")
+# ===========================
+# Streamlit page config
+# ===========================
+st.set_page_config(page_title="EduTransAI - Word to Excel", layout="wide")
+st.title("📑 Word to Excel Converter (Source + GT + Student + Reference)")
 
-# --- Function to read Word file and extract paragraphs ---
-def read_word(file):
-    doc = Document(file)
-    data = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return data
-
-# --- File uploader ---
-uploaded_file = st.file_uploader("Upload Word or Excel file", type=["docx", "xlsx"])
+# ===========================
+# File Upload
+# ===========================
+uploaded_file = st.file_uploader("Upload a Word file (.docx)", type=["docx"])
 
 if uploaded_file:
-    if uploaded_file.name.endswith(".docx"):
-        texts = read_word(uploaded_file)
-        st.write("✅ Extracted paragraphs:", len(texts))
+    try:
+        # Load Word document
+        doc = Document(uploaded_file)
 
-        # Create empty DataFrame with 19 ID columns
-        columns = [f"ID{i}" for i in range(1, 20)]
-        df = pd.DataFrame(columns=columns)
+        # Prepare lists
+        ids, sources, gts, students, refs = [], [], [], [], []
+        current_id, source, gt, student, reference = None, None, None, None, None
 
-        # Fill rows sequentially (4 per set: Source, GT, Student, Reference)
-        for i in range(0, len(texts), 4):
-            row = {}
-            row["ID1"] = texts[i] if i < len(texts) else ""
-            row["ID2"] = texts[i+1] if i+1 < len(texts) else ""
-            row["ID3"] = texts[i+2] if i+2 < len(texts) else ""
-            row["ID4"] = texts[i+3] if i+3 < len(texts) else ""
-            df.loc[len(df)] = row
+        # Parse document
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if not text:
+                continue
 
-        st.dataframe(df, use_container_width=True)
+            if text.startswith("ID"):  # Start new record
+                if current_id and (source or gt or student or reference):
+                    ids.append(current_id)
+                    sources.append(source)
+                    gts.append(gt)
+                    students.append(student)
+                    refs.append(reference)
 
-    elif uploaded_file.name.endswith(".xlsx"):
-        df = pd.read_excel(uploaded_file)
-        st.dataframe(df, use_container_width=True)
+                current_id = text
+                source, gt, student, reference = None, None, None, None
 
-    # --- Download button ---
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    st.download_button(
-        label="Download Aligned Excel",
-        data=output.getvalue(),
-        file_name="aligned_translations.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+            elif text.startswith("Source:"):
+                source = text.replace("Source:", "").strip()
+            elif text.startswith("GT:"):
+                gt = text.replace("GT:", "").strip()
+            elif text.startswith("Student:"):
+                student = text.replace("Student:", "").strip()
+            elif text.startswith("Reference:"):
+                reference = text.replace("Reference:", "").strip()
+
+        # Save the last one
+        if current_id and (source or gt or student or reference):
+            ids.append(current_id)
+            sources.append(source)
+            gts.append(gt)
+            students.append(student)
+            refs.append(reference)
+
+        # Create DataFrame
+        df = pd.DataFrame({
+            "ID": ids,
+            "Source": sources,
+            "GT": gts,
+            "Student": students,
+            "Reference": refs
+        })
+
+        # Preview
+        st.subheader("✅ Extracted Data")
+        st.dataframe(df)
+
+        # Export to Excel
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Translations")
+
+        st.download_button(
+            label="Download Excel File",
+            data=output.getvalue(),
+            file_name="translations.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        st.error(f"Error while processing: {e}")
+else:
+    st.info("Upload a Word file with IDs, Source, GT, Student, and Reference.")
