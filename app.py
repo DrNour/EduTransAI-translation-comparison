@@ -34,47 +34,48 @@ def simple_tokenize(text):
 def cosine_similarity(vec1, vec2):
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8)
 
-def fluency_score(text):
-    if not text.strip():
-        return 1
-    penalties = len(re.findall(r'\s{2,}', text)) + len(re.findall(r'[^\w\s.,;:!?]', text))
-    length = len(text.split())
-    score = max(1, min(5, 5 - penalties*0.5, length/20))
-    return round(score, 2)
+def semantic_accuracy_score(text1, text2, embed_cache):
+    """Return cosine, BLEU, and hybrid Accuracy"""
+    vec1, vec2 = embed_cache[text1], embed_cache[text2]
+    cosine_sim = cosine_similarity(vec1, vec2)
+    bleu = sentence_bleu([simple_tokenize(text1)], simple_tokenize(text2),
+                         smoothing_function=SmoothingFunction().method4)
+    hybrid = round(0.7 * cosine_sim + 0.3 * bleu, 3)
+    return round(cosine_sim, 3), round(bleu, 3), hybrid
 
-def enhanced_error_detection(text, reference=None, other_texts=None, embed_cache=None):
+def fluency_score(text):
+    """Estimate fluency based on length balance, punctuation, and surface cleanliness"""
+    if not text.strip():
+        return 1.0
+    words = text.split()
+    avg_word_len = np.mean([len(w) for w in words]) if words else 0
+    sentence_endings = len(re.findall(r'[.!?]', text))
+    num_sentences = max(1, sentence_endings)
+    avg_sentence_len = len(words) / num_sentences
+    penalty = len(re.findall(r'\s{2,}', text)) + len(re.findall(r'[^\w\s.,;:!?\'"-]', text))
+    score = 5 - (abs(avg_sentence_len - 20)/20 + penalty*0.3 + abs(avg_word_len - 5)*0.2)
+    return round(max(1, min(score, 5)), 2)
+
+def enhanced_error_detection(text, reference=None, embed_cache=None):
+    """Detect fluency and semantic issues"""
     fluency = fluency_score(text)
-    style_score = 0
-    if embed_cache and embed_cache.values():
-        emb = embed_cache[text]
-        all_embeddings = np.array(list(embed_cache.values()))
-        style_score = np.mean([cosine_similarity(emb, e) for e in all_embeddings])
-        style_score = round(style_score, 3)
     errors = []
+    cosine_sim = bleu = hybrid = None
+
     if fluency < 3:
         errors.append("Fluency/Grammar")
-    words = text.split()
-    if len(words) < 3:
+    if reference and embed_cache:
+        cosine_sim, bleu, hybrid = semantic_accuracy_score(reference, text, embed_cache)
+        if hybrid < 0.6:
+            errors.append("Semantic Deviation")
+        elif hybrid < 0.8:
+            errors.append("Partial Accuracy")
+    if len(text.split()) < 3:
         errors.append("Too Short")
-    elif len(words) > 50:
-        errors.append("Too Long / Style Issue")
-    if reference:
-        ref_tokens = reference.split()
-        diff = list(difflib.ndiff(ref_tokens, words))
-        additions = sum(1 for d in diff if d.startswith('+ '))
-        deletions = sum(1 for d in diff if d.startswith('- '))
-        if additions > 0:
-            errors.append("Addition")
-        if deletions > 0:
-            errors.append("Deletion")
-        if cosine_similarity(embed_cache[reference], embed_cache[text]) < 0.7:
-            errors.append("Semantic / Meaning")
-    if other_texts:
-        for other in other_texts:
-            sim = cosine_similarity(embed_cache[text], embed_cache[other])
-            if sim < 0.6:
-                errors.append("Style / Idiomaticity")
-    return fluency, style_score, ", ".join(sorted(set(errors))) if errors else "None"
+    elif len(text.split()) > 60:
+        errors.append("Too Long / Verbosity")
+
+    return fluency, cosine_sim, bleu, hybrid, ", ".join(sorted(set(errors))) if errors else "None"
 
 # ===========================
 # File upload
@@ -125,7 +126,6 @@ if uploaded_file:
 
         if translation_cols and st.button("Run Analysis"):
             st.subheader("✅ Analysis Results")
-            smoothie = SmoothingFunction().method4
             results = []
 
             # ---------------------------
@@ -147,12 +147,7 @@ if uploaded_file:
                     trans_text = str(row[t_col])
                     if source_col and mode == "Reference-based":
                         source_text = str(row[source_col])
-                        bleu = sentence_bleu(
-                            [simple_tokenize(source_text)],
-                            simple_tokenize(trans_text),
-                            smoothing_function=smoothie
-                        )
-                        fluency, style_score, error_str = enhanced_error_detection(
+                        fluency, cosine_sim, bleu, hybrid, error_str = enhanced_error_detection(
                             trans_text,
                             reference=source_text,
                             embed_cache=embed_cache
@@ -160,39 +155,43 @@ if uploaded_file:
                         seq = difflib.ndiff(source_text.split(), trans_text.split())
                         diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
                         row_result.update({
-                            f"{t_col}_BLEU": round(bleu,3),
+                            f"{t_col}_BLEU": bleu,
+                            f"{t_col}_Cosine": cosine_sim,
+                            f"{t_col}_Accuracy": hybrid,
                             f"{t_col}_Fluency": fluency,
-                            f"{t_col}_Style": style_score,
-                            f"{t_col}_Diff": diff,
-                            f"{t_col}_Errors": error_str
+                            f"{t_col}_Errors": error_str,
+                            f"{t_col}_Diff": diff
                         })
                     elif mode == "Pairwise Comparison":
                         for other_col in translation_cols:
                             if other_col == t_col:
                                 continue
                             other_text = str(row[other_col])
-                            bleu = sentence_bleu([simple_tokenize(other_text)], simple_tokenize(trans_text), smoothing_function=smoothie)
-                            fluency, style_score, error_str = enhanced_error_detection(
+                            fluency, cosine_sim, bleu, hybrid, error_str = enhanced_error_detection(
                                 trans_text,
-                                other_texts=[other_text],
+                                reference=other_text,
                                 embed_cache=embed_cache
                             )
                             seq = difflib.ndiff(other_text.split(), trans_text.split())
                             diff = ' '.join([f"[{s}]" if s.startswith('-') or s.startswith('+') else s for s in seq])
                             row_result.update({
-                                f"{t_col}_vs_{other_col}_BLEU": round(bleu,3),
-                                f"{t_col}_vs_{other_col}_Style": style_score,
-                                f"{t_col}_vs_{other_col}_Diff": diff,
-                                f"{t_col}_vs_{other_col}_Errors": error_str
+                                f"{t_col}_vs_{other_col}_BLEU": bleu,
+                                f"{t_col}_vs_{other_col}_Cosine": cosine_sim,
+                                f"{t_col}_vs_{other_col}_Accuracy": hybrid,
+                                f"{t_col}_vs_{other_col}_Fluency": fluency,
+                                f"{t_col}_vs_{other_col}_Errors": error_str,
+                                f"{t_col}_vs_{other_col}_Diff": diff
                             })
                     elif mode == "Standalone Student Assessment":
-                        fluency, style_score, error_str = enhanced_error_detection(
+                        fluency, cosine_sim, bleu, hybrid, error_str = enhanced_error_detection(
                             trans_text,
                             embed_cache=embed_cache
                         )
                         row_result.update({
                             f"{t_col}_Fluency": fluency,
-                            f"{t_col}_Style": style_score,
+                            f"{t_col}_Cosine": cosine_sim,
+                            f"{t_col}_BLEU": bleu,
+                            f"{t_col}_Accuracy": hybrid,
                             f"{t_col}_Errors": error_str
                         })
                 results.append(row_result)
@@ -203,9 +202,9 @@ if uploaded_file:
             # Identify Best Translation per sentence
             # ---------------------------
             if mode == "Reference-based":
-                bleu_cols = [c for c in res_df.columns if c.endswith("_BLEU")]
-                res_df["Best_Translation"] = res_df[bleu_cols].idxmax(axis=1)
-                res_df["Best_Translation"] = res_df["Best_Translation"].str.replace("_BLEU","")
+                acc_cols = [c for c in res_df.columns if c.endswith("_Accuracy")]
+                res_df["Best_Translation"] = res_df[acc_cols].idxmax(axis=1)
+                res_df["Best_Translation"] = res_df["Best_Translation"].str.replace("_Accuracy","")
 
             st.dataframe(res_df.head(20))
 
@@ -219,9 +218,9 @@ if uploaded_file:
                     flag_col = col.replace("_Fluency", "_Low_Fluency_Flag")
                     res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 3 else "")
                     flagged_cols.append(flag_col)
-                elif col.endswith("_Style"):
-                    flag_col = col.replace("_Style", "_Low_Style_Flag")
-                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 0.5 else "")
+                elif col.endswith("_Accuracy"):
+                    flag_col = col.replace("_Accuracy", "_Low_Accuracy_Flag")
+                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if x < 0.6 else "")
                     flagged_cols.append(flag_col)
                 elif col.endswith("_BLEU"):
                     flag_col = col.replace("_BLEU", "_Low_BLEU_Flag")
@@ -231,71 +230,77 @@ if uploaded_file:
                 st.dataframe(res_df[flagged_cols].head(20))
 
             # ---------------------------
-            # BLEU Heatmap
+            # Heatmaps
             # ---------------------------
             if mode == "Reference-based":
-                st.subheader("📈 Per-Sentence BLEU Heatmap")
-                bleu_df = res_df[bleu_cols]
-                plt.figure(figsize=(12, len(res_df)*0.3 + 2))
-                sns.heatmap(bleu_df, annot=True, fmt=".2f", cmap="YlGnBu", cbar_kws={'label':'BLEU Score'})
-                plt.ylabel("Sentence Index")
-                plt.xlabel("Translation / Student")
-                plt.title("BLEU Score per Sentence")
-                st.pyplot(plt)
+                st.subheader("📈 Per-Sentence Similarity Heatmaps")
+                metric_sets = {
+                    "BLEU": [c for c in res_df.columns if c.endswith("_BLEU")],
+                    "Cosine": [c for c in res_df.columns if c.endswith("_Cosine")],
+                    "Accuracy": [c for c in res_df.columns if c.endswith("_Accuracy")]
+                }
+                for metric, cols in metric_sets.items():
+                    if not cols:
+                        continue
+                    plt.figure(figsize=(12, len(res_df)*0.3 + 2))
+                    sns.heatmap(res_df[cols], annot=True, fmt=".2f", cmap="YlGnBu",
+                                cbar_kws={'label': f'{metric} Score'})
+                    plt.ylabel("Sentence Index")
+                    plt.xlabel("Translation / Student")
+                    plt.title(f"{metric} per Sentence")
+                    st.pyplot(plt)
 
             # ---------------------------
             # Dashboard Metrics
             # ---------------------------
-            st.subheader("📊 Dashboard")
-            metrics = []
+            st.subheader("📊 Dashboard Summary")
             if mode == "Reference-based":
-                metrics = ["BLEU", "Fluency", "Style"]
+                metrics = ["BLEU", "Cosine", "Accuracy", "Fluency"]
             elif mode == "Pairwise Comparison":
-                metrics = ["BLEU", "Style"]
+                metrics = ["BLEU", "Cosine", "Accuracy"]
             elif mode == "Standalone Student Assessment":
-                metrics = ["Fluency", "Style"]
+                metrics = ["Fluency"]
+
             for metric in metrics:
-                plt.figure(figsize=(10, 4))
+                plt.figure(figsize=(10,4))
                 metric_cols = [c for c in res_df.columns if c.endswith(metric)]
                 if metric_cols:
                     sns.boxplot(data=res_df[metric_cols])
                     plt.ylabel(metric)
-                    plt.title(f"{metric} per Translation / Student")
+                    plt.title(f"{metric} Distribution Across Students / Translations")
                     st.pyplot(plt)
 
             # ---------------------------
-            # Error Categories Summary
+            # Clean CSV Export
             # ---------------------------
-            st.subheader("📌 Error Categories Summary")
-            error_cols = [c for c in res_df.columns if c.endswith("Errors")]
-            if error_cols:
-                error_counts = {}
-                for col in error_cols:
-                    col_errors = res_df[col].apply(lambda x: str(x).split(", ") if x != "None" else [])
-                    counts = {}
-                    for errors_list in col_errors:
-                        for e in errors_list:
-                            counts[e] = counts.get(e, 0) + 1
-                    error_counts[col] = counts
+            st.subheader("📥 Export Cleaned Results")
+            preferred_order = []
+            for base in translation_cols:
+                for metric in ["Accuracy", "BLEU", "Cosine", "Fluency", "Errors"]:
+                    matches = [c for c in res_df.columns if c.startswith(base) and c.endswith(metric)]
+                    preferred_order.extend(matches)
+            flag_cols = [c for c in res_df.columns if "Flag" in c]
+            preferred_order.extend(flag_cols)
+            other_cols = [c for c in res_df.columns if c not in preferred_order]
+            ordered_cols = preferred_order + other_cols
+            res_df = res_df[ordered_cols]
 
-                all_errors = set(e for counts in error_counts.values() for e in counts)
-                plot_df = pd.DataFrame(0, index=error_cols, columns=sorted(all_errors))
-                for col in error_cols:
-                    for e, cnt in error_counts[col].items():
-                        plot_df.loc[col, e] = cnt
-                plot_df.plot(kind="bar", stacked=True, figsize=(12,6), colormap="tab20")
-                plt.ylabel("Number of Sentences")
-                plt.xlabel("Translation / Student")
-                plt.title("Distribution of Error Categories per Translation / Student")
-                plt.xticks(rotation=45)
-                plt.legend(title="Error Category", bbox_to_anchor=(1.05, 1), loc='upper left')
-                st.pyplot(plt)
-
-            # ---------------------------
-            # Download CSV
-            # ---------------------------
+            # Human-readable column names
+            res_df.columns = (
+                res_df.columns
+                .str.replace("_", " ")
+                .str.replace(" BLEU", " (BLEU)")
+                .str.replace(" Accuracy", " (Hybrid Accuracy)")
+                .str.replace(" Cosine", " (Semantic Cosine)")
+                .str.replace(" Fluency", " (Fluency)")
+                .str.replace(" Errors", " (Error Categories)")
+                .str.replace(" Flag", " ⚠️")
+            )
+            res_df = res_df.applymap(lambda x: round(x,3) if isinstance(x,(float,int)) else x)
+            st.dataframe(res_df.head(20))
             csv = res_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button("Download Full Analysis Results", csv, "translation_analysis_results.csv", "text/csv")
+            st.download_button("Download Full Analysis Results (Clean CSV)", csv,
+                               "translation_analysis_clean.csv", "text/csv")
 
     except Exception as e:
         st.error(f"Error: {e}")
