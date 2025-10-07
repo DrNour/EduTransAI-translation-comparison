@@ -1,8 +1,13 @@
-# app.py (improved)
-# ---------------------------------
+# app.py (improved + streamlined metrics, thresholds, labels, metadata)
+# ---------------------------------------------------------------------------------
 # EduTransAI - Translation Comparison & Student Assessment
-# This version adds: robust normalization, stronger hybrid metric (cosine+CHRF/BLEU with length penalty),
-# safer/faster embedding cache, clearer token-level diffs, adaptive thresholds, and lighter UI rendering.
+# Adds the requested features:
+# 1) Streamline metrics – one representative semantic score (Hybrid Accuracy) + separate Fluency.
+#    (Already present as `*_Accuracy` and `*_Fluency`; clarified in labels/exports.)
+# 2) Recalibrate thresholds – quantile-based cutoffs with sensible defaults
+#    (BLEU/CHRF < 0.15, Fluency < 3.0, Hybrid < 20th pct).
+# 3) Normalize error labels – canonical label vocabulary for aggregation/ML.
+# 4) Augment metadata – language/domain/genre + per-domain diagnostics.
 
 import streamlit as st
 import pandas as pd
@@ -50,6 +55,29 @@ with st.sidebar:
         "Use CHRF for lexical overlap (fallback to BLEU if unavailable)",
         value=True,
     )
+
+    st.markdown("---")
+    st.subheader("🧩 Metadata (optional)")
+    st.caption("Add metadata for per-domain diagnostics and export.")
+
+    meta_mode = st.radio("Metadata source", ["None", "Use existing columns", "Set constants"], index=0)
+
+    language_val = domain_val = genre_val = None
+    language_col = domain_col = genre_col = None
+
+    if meta_mode == "Use existing columns":
+        # Detect likely columns
+        cols = []
+        try:
+            # Will be filled after upload – we guard with try/except and handle later.
+            pass
+        except Exception:
+            pass
+        st.caption("You'll be able to select columns after uploading.")
+    elif meta_mode == "Set constants":
+        language_val = st.text_input("Language (constant for all rows)", value="")
+        domain_val = st.text_input("Domain (constant for all rows)", value="")
+        genre_val = st.text_input("Genre (constant for all rows)", value="")
 
 # ===========================
 # Load model (cached per model name)
@@ -115,8 +143,6 @@ def semantic_accuracy_score(ref: str, hyp: str, embed_cache: dict,
     v_ref, v_hyp = get_vec(ref_n, embed_cache), get_vec(hyp_n, embed_cache)
     cosine = float(np.dot(v_ref, v_hyp)) if (v_ref is not None and v_hyp is not None) else 0.0
 
-    lexical = 0.0
-    used_metric = "BLEU"
     if prefer_chrf and _CHRF is not None:
         lexical = chrf_score(ref_n, hyp_n)
         used_metric = "CHRF"
@@ -125,6 +151,7 @@ def semantic_accuracy_score(ref: str, hyp: str, embed_cache: dict,
             sentence_bleu([simple_tokenize(ref_n)], simple_tokenize(hyp_n),
                            smoothing_function=SmoothingFunction().method4)
         )
+        used_metric = "BLEU"
     penalty = length_ratio_penalty(ref_n, hyp_n)
     hybrid = np.clip(w_sem * cosine + w_lex * lexical, 0, 1) * penalty
     return round(cosine, 3), used_metric, round(lexical, 3), round(hybrid, 3)
@@ -170,6 +197,7 @@ def token_diff(a: str, b: str) -> str:
 
 
 def dynamic_thresholds(ref_len_tokens: int):
+    # retained for row-wise adaptivity; global low cutoffs are added later
     acc = 0.60
     lex = 0.50
     if ref_len_tokens >= 25:
@@ -178,6 +206,35 @@ def dynamic_thresholds(ref_len_tokens: int):
         acc += 0.05; lex += 0.05
     return acc, lex
 
+# -----------------------------
+# Error label normalization
+# -----------------------------
+# Canonical vocabulary tailored for this app
+LABEL_CANON = {
+    "fluency": ["fluency/grammar", "grammar", "fluency issues"],
+    "semantic": ["semantic deviation", "meaning error", "mismatch"],
+    "lexical": ["low lexical overlap", "lexical low", "overlap low"],
+    "length_short": ["too short", "short"],
+    "length_long": ["too long / verbosity", "too long", "verbosity"],
+}
+# Build lookup
+_LABEL_LOOKUP = {k: k for k in LABEL_CANON}
+for k, aliases in LABEL_CANON.items():
+    for a in aliases:
+        _LABEL_LOOKUP[a.lower()] = k
+
+
+def normalize_labels(raw_list):
+    norm = []
+    for raw in (raw_list or []):
+        canon = _LABEL_LOOKUP.get(str(raw).strip().lower())
+        norm.append(canon if canon else f"other:{raw}")
+    # dedup keep order
+    seen, out = set(), []
+    for x in norm:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
 
 # ===========================
 # File upload
@@ -235,6 +292,15 @@ if uploaded_file:
             if not translation_cols:
                 st.warning("Select at least one translation column.")
 
+        # Metadata column selection (if user chose existing columns)
+        if meta_mode == "Use existing columns":
+            language_col = st.selectbox("Language column (optional)", ["<none>"] + list(df.columns), index=0)
+            domain_col = st.selectbox("Domain column (optional)", ["<none>"] + list(df.columns), index=0)
+            genre_col = st.selectbox("Genre column (optional)", ["<none>"] + list(df.columns), index=0)
+            language_col = None if language_col == "<none>" else language_col
+            domain_col = None if domain_col == "<none>" else domain_col
+            genre_col = None if genre_col == "<none>" else genre_col
+
         if translation_cols and st.button("Run Analysis"):
             st.subheader("✅ Analysis Results")
             results = []
@@ -258,8 +324,16 @@ if uploaded_file:
             # ---------------------------
             # Analyze each row
             # ---------------------------
+            per_row_meta = []
             for idx, row in df.iterrows():
                 row_result = {}
+
+                # row metadata (constant or columns)
+                lang_val = (language_val if meta_mode == "Set constants" else (row.get(language_col, "") if language_col else ""))
+                dom_val = (domain_val if meta_mode == "Set constants" else (row.get(domain_col, "") if domain_col else ""))
+                gen_val = (genre_val if meta_mode == "Set constants" else (row.get(genre_col, "") if genre_col else ""))
+                per_row_meta.append({"Language": lang_val or "", "Domain": dom_val or "", "Genre": gen_val or ""})
+
                 for t_col in translation_cols:
                     trans_text = str(row[t_col])
                     trans_text_norm = str(df_norm.iloc[idx][t_col])
@@ -277,20 +351,22 @@ if uploaded_file:
                         )
                         flu = fluency_score(trans_text)
 
-                        # Adaptive thresholds
+                        # Adaptive thresholds (length-aware)
                         acc_thr, lex_thr = dynamic_thresholds(ref_lens[idx])
-                        err = []
+                        errs_raw = []
                         if flu < 3:
-                            err.append("Fluency/Grammar")
+                            errs_raw.append("Fluency/Grammar")
                         if hybrid < acc_thr:
-                            err.append("Semantic Deviation")
+                            errs_raw.append("Semantic Deviation")
                         if lexical < lex_thr:
-                            err.append("Low Lexical Overlap")
+                            errs_raw.append("Low Lexical Overlap")
                         n_words = len(trans_text_norm.split())
                         if n_words < 3:
-                            err.append("Too Short")
+                            errs_raw.append("Too Short")
                         elif n_words > 60:
-                            err.append("Too Long / Verbosity")
+                            errs_raw.append("Too Long / Verbosity")
+
+                        errs_norm = normalize_labels(errs_raw)
 
                         row_result.update({
                             f"{t_col}_LexicalMetric": used_metric,
@@ -298,7 +374,8 @@ if uploaded_file:
                             f"{t_col}_Cosine": cosine_sim,
                             f"{t_col}_Accuracy": hybrid,
                             f"{t_col}_Fluency": flu,
-                            f"{t_col}_Errors": ", ".join(sorted(set(err))) if err else "None",
+                            f"{t_col}_Errors": ", ".join(sorted(set(errs_raw))) if errs_raw else "None",
+                            f"{t_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                         })
 
                         # Inline diff (HTML, not exported)
@@ -320,14 +397,15 @@ if uploaded_file:
                                 prefer_chrf=use_chrf,
                             )
                             flu = fluency_score(trans_text)
-                            err = []
+                            errs_raw = []
                             if flu < 3:
-                                err.append("Fluency/Grammar")
+                                errs_raw.append("Fluency/Grammar")
                             n_words = len(trans_text_norm.split())
                             if n_words < 3:
-                                err.append("Too Short")
+                                errs_raw.append("Too Short")
                             elif n_words > 60:
-                                err.append("Too Long / Verbosity")
+                                errs_raw.append("Too Long / Verbosity")
+                            errs_norm = normalize_labels(errs_raw)
 
                             row_result.update({
                                 f"{t_col}_vs_{other_col}_LexicalMetric": used_metric,
@@ -335,11 +413,14 @@ if uploaded_file:
                                 f"{t_col}_vs_{other_col}_Cosine": cosine_sim,
                                 f"{t_col}_vs_{other_col}_Accuracy": hybrid,
                                 f"{t_col}_vs_{other_col}_Fluency": flu,
-                                f"{t_col}_vs_{other_col}_Errors": ", ".join(sorted(set(err))) if err else "None",
+                                f"{t_col}_vs_{other_col}_Errors": ", ".join(sorted(set(errs_raw))) if errs_raw else "None",
+                                f"{t_col}_vs_{other_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                             })
 
                     elif mode == "Standalone Student Assessment":
                         flu = fluency_score(trans_text)
+                        errs_raw = [] if flu >= 3 else ["Fluency/Grammar"]
+                        errs_norm = normalize_labels(errs_raw)
                         # No reference: cosine/lexical/hybrid are None
                         row_result.update({
                             f"{t_col}_Fluency": flu,
@@ -347,11 +428,13 @@ if uploaded_file:
                             f"{t_col}_Lexical": None,
                             f"{t_col}_Accuracy": None,
                             f"{t_col}_Errors": "None" if flu >= 3 else "Fluency/Grammar",
+                            f"{t_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                         })
 
                 results.append(row_result)
 
             res_df = pd.DataFrame(results)
+            meta_df = pd.DataFrame(per_row_meta) if per_row_meta else pd.DataFrame()
 
             # ---------------------------
             # Identify Best Translation per sentence (Reference-based)
@@ -365,30 +448,83 @@ if uploaded_file:
             st.dataframe(res_df.head(20))
 
             # ---------------------------
-            # Low-Quality Flags (using adaptive thresholds when applicable)
+            # Quantile-based global thresholds (recalibration)
+            # ---------------------------
+            def _collect_cols(suffix):
+                return [c for c in res_df.columns if c.endswith(suffix)]
+
+            lex_vals = pd.concat([res_df[c] for c in _collect_cols("_Lexical")], axis=0) if _collect_cols("_Lexical") else pd.Series(dtype=float)
+            flu_vals = pd.concat([res_df[c] for c in _collect_cols("_Fluency")], axis=0) if _collect_cols("_Fluency") else pd.Series(dtype=float)
+            acc_vals = pd.concat([res_df[c] for c in _collect_cols("_Accuracy")], axis=0) if _collect_cols("_Accuracy") else pd.Series(dtype=float)
+
+            def safe_q(s, q, default):
+                s = pd.to_numeric(s, errors='coerce').dropna()
+                if s.empty:
+                    return default
+                try:
+                    return float(s.quantile(q))
+                except Exception:
+                    return default
+
+            # Defaults as examples
+            default_bleu_or_chrf_low = 0.15
+            default_fluency_low = 3.0
+            default_hybrid_low = 0.50
+
+            q_lex = safe_q(lex_vals, 0.10, default_bleu_or_chrf_low)
+            q_flu = safe_q(flu_vals, 0.10, default_fluency_low)
+            q_acc = safe_q(acc_vals, 0.20, default_hybrid_low)
+
+            # choose the stricter (max) between empirical and defaults to avoid too-lenient cutoffs
+            LEX_LOW = max(default_bleu_or_chrf_low, q_lex)
+            FLU_LOW = max(default_fluency_low, q_flu)
+            ACC_LOW = q_acc  # 20th percentile is already data-driven; keep default only if NaN handled above
+
+            st.markdown(f"**Calibrated Low Cutoffs:** Lexical < `{LEX_LOW:.2f}`, Fluency < `{FLU_LOW:.2f}`, Hybrid Accuracy < `{ACC_LOW:.2f}`")
+
+            # ---------------------------
+            # Low-Quality Flags – Global (quantiles) + Adaptive (length)
             # ---------------------------
             st.subheader("⚠️ Low-Quality Translation Flags")
             flagged_cols = []
+
             if mode == "Reference-based" and source_col:
                 for i in range(len(res_df)):
-                    acc_thr, lex_thr = dynamic_thresholds(ref_lens[i])
+                    # adaptive thresholds by sentence length
+                    acc_thr_adapt, lex_thr_adapt = dynamic_thresholds(ref_lens[i])
                     for c in translation_cols:
-                        acc_col = f"{c}_Accuracy"
-                        lex_col = f"{c}_Lexical"
+                        acc_col = f"{c}_Accuracy"; lex_col = f"{c}_Lexical"; flu_col = f"{c}_Fluency"
+
                         if acc_col in res_df.columns:
-                            flag_c = acc_col.replace("_Accuracy", "_Low_Accuracy_Flag")
-                            res_df.loc[i, flag_c] = "⚠️" if pd.notna(res_df.loc[i, acc_col]) and res_df.loc[i, acc_col] < acc_thr else ""
-                            flagged_cols.append(flag_c)
+                            # Two flags: global and adaptive
+                            flag_c_g = acc_col.replace("_Accuracy", "_Low_Hybrid_Flag_Global")
+                            flag_c_a = acc_col.replace("_Accuracy", "_Low_Hybrid_Flag_Adaptive")
+                            val = res_df.loc[i, acc_col]
+                            res_df.loc[i, flag_c_g] = "⚠️" if pd.notna(val) and val < ACC_LOW else ""
+                            res_df.loc[i, flag_c_a] = "⚠️" if pd.notna(val) and val < acc_thr_adapt else ""
+                            flagged_cols += [flag_c_g, flag_c_a]
+
                         if lex_col in res_df.columns:
-                            flag_l = lex_col.replace("_Lexical", "_Low_Lexical_Flag")
-                            res_df.loc[i, flag_l] = "⚠️" if pd.notna(res_df.loc[i, lex_col]) and res_df.loc[i, lex_col] < lex_thr else ""
-                            flagged_cols.append(flag_l)
-            # Fluency flags (all modes)
-            for col in res_df.columns:
-                if col.endswith("_Fluency"):
-                    flag_col = col.replace("_Fluency", "_Low_Fluency_Flag")
-                    res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if pd.notna(x) and x < 3 else "")
-                    flagged_cols.append(flag_col)
+                            flag_l_g = lex_col.replace("_Lexical", "_Low_Lexical_Flag_Global")
+                            flag_l_a = lex_col.replace("_Lexical", "_Low_Lexical_Flag_Adaptive")
+                            val = res_df.loc[i, lex_col]
+                            res_df.loc[i, flag_l_g] = "⚠️" if pd.notna(val) and val < LEX_LOW else ""
+                            res_df.loc[i, flag_l_a] = "⚠️" if pd.notna(val) and val < lex_thr_adapt else ""
+                            flagged_cols += [flag_l_g, flag_l_a]
+
+                        if flu_col in res_df.columns:
+                            flag_f_g = flu_col.replace("_Fluency", "_Low_Fluency_Flag_Global")
+                            val = res_df.loc[i, flu_col]
+                            res_df.loc[i, flag_f_g] = "⚠️" if pd.notna(val) and val < FLU_LOW else ""
+                            flagged_cols.append(flag_f_g)
+
+            # Fluency flags (all modes) – global only when not reference-based
+            if mode != "Reference-based":
+                for col in res_df.columns:
+                    if col.endswith("_Fluency"):
+                        flag_col = col.replace("_Fluency", "_Low_Fluency_Flag_Global")
+                        res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if pd.notna(x) and x < FLU_LOW else "")
+                        flagged_cols.append(flag_col)
 
             if flagged_cols:
                 st.dataframe(res_df[sorted(set(flagged_cols))].head(20))
@@ -435,12 +571,62 @@ if uploaded_file:
                     st.pyplot(plt)
 
             # ---------------------------
+            # Per-domain diagnostics (using metadata)
+            # ---------------------------
+            st.subheader("🗂️ Per-Domain Diagnostics")
+            if meta_df.shape[0] == res_df.shape[0]:
+                # Build long format per translation
+                long_rows = []
+                for i in range(len(res_df)):
+                    meta_row = meta_df.iloc[i].to_dict() if not meta_df.empty else {}
+                    for base in translation_cols:
+                        rec = {
+                            **meta_row,
+                            "Student": base,
+                            "Accuracy": res_df.loc[i, f"{base}_Accuracy"] if f"{base}_Accuracy" in res_df.columns else np.nan,
+                            "Fluency": res_df.loc[i, f"{base}_Fluency"] if f"{base}_Fluency" in res_df.columns else np.nan,
+                            "Lexical": res_df.loc[i, f"{base}_Lexical"] if f"{base}_Lexical" in res_df.columns else np.nan,
+                            "ErrorsNorm": res_df.loc[i, f"{base}_ErrorsNorm"] if f"{base}_ErrorsNorm" in res_df.columns else "",
+                        }
+                        long_rows.append(rec)
+                long_df = pd.DataFrame(long_rows)
+
+                # Aggregate
+                if not long_df.empty:
+                    group_keys = [k for k in ["Domain", "Language", "Genre"] if k in long_df.columns]
+                    if not group_keys:
+                        st.caption("No metadata provided; skipping per-domain aggregates.")
+                    else:
+                        # label prevalence
+                        def top_labels(sub):
+                            labels = ",".join(sub["ErrorsNorm"].dropna().astype(str)).split(",")
+                            labels = [x for x in labels if x]
+                            if not labels:
+                                return ""
+                            s = pd.Series(labels).value_counts(normalize=True)
+                            pairs = [f"{lab}:{share:.0%}" for lab, share in s.head(3).items()]
+                            return ", ".join(pairs)
+
+                        agg = long_df.groupby(group_keys).agg(
+                            Count=("Accuracy", "count"),
+                            Accuracy_Mean=("Accuracy", "mean"),
+                            Accuracy_Std=("Accuracy", "std"),
+                            Fluency_Mean=("Fluency", "mean"),
+                            Fluency_Std=("Fluency", "std"),
+                            Lexical_Mean=("Lexical", "mean"),
+                            Top_Labels=("ErrorsNorm", top_labels),
+                        ).reset_index()
+                        st.dataframe(agg)
+            else:
+                st.caption("Metadata shape mismatch; per-domain diagnostics skipped.")
+
+            # ---------------------------
             # Clean CSV Export (exclude HTML diffs)
             # ---------------------------
             st.subheader("📥 Export Cleaned Results")
             preferred_order = []
             for base in translation_cols:
-                for metric in ["Accuracy", "Lexical", "Cosine", "Fluency", "Errors"]:
+                for metric in ["Accuracy", "Lexical", "Cosine", "Fluency", "Errors", "ErrorsNorm"]:
                     matches = [c for c in res_df.columns if c.startswith(base) and c.endswith(metric)]
                     preferred_order.extend(matches)
                 # include metric name column if present
@@ -453,7 +639,11 @@ if uploaded_file:
             preferred_order.extend(flag_cols)
             other_cols = [c for c in res_df.columns if c not in preferred_order]
             ordered_cols = preferred_order + other_cols
+
             export_df = res_df[ordered_cols].copy()
+            # attach metadata to export
+            if not meta_df.empty:
+                export_df = pd.concat([meta_df, export_df], axis=1)
 
             # Human-readable column names
             export_df.columns = (
@@ -463,11 +653,13 @@ if uploaded_file:
                 .str.replace(" Accuracy", " (Hybrid Accuracy)")
                 .str.replace(" Cosine", " (Semantic Cosine)")
                 .str.replace(" Fluency", " (Fluency)")
-                .str.replace(" Errors", " (Error Categories)")
+                .str.replace(" ErrorsNorm", " (Error Labels – Canonical)")
+                .str.replace(" Errors", " (Error Categories – Raw)")
                 .str.replace(" Flag", " ⚠️", regex=False)
             )
             export_df = export_df.applymap(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
 
+            # Show a peek
             st.dataframe(export_df.head(20))
             csv = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
@@ -476,6 +668,14 @@ if uploaded_file:
                 "translation_analysis_clean.csv",
                 "text/csv",
             )
+
+            # show calibrated thresholds summary
+            with st.expander("Thresholds (Quantile-based) Details", expanded=False):
+                st.write({
+                    "Lexical_Low": LEX_LOW,
+                    "Fluency_Low": FLU_LOW,
+                    "Hybrid_Low": ACC_LOW,
+                })
 
     except Exception as e:
         st.error(f"Error: {e}")
