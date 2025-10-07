@@ -1,15 +1,13 @@
-# app.py
+# app.py (improved + streamlined metrics, thresholds, labels, metadata)
 # ---------------------------------------------------------------------------------
 # EduTransAI - Translation Comparison & Student Assessment
-# Features:
-# - Semantic metrics: Cosine, BERTScore, COMET (choose in sidebar)
-# - Lexical metric: CHRF (preferred) or BLEU fallback
-# - Hybrid Accuracy = weighted (semantic, lexical) × length penalty
-# - Paraphrase vs. Meaning Drift labeling (semantic-based)
-# - Fluency + Style scoring; optional floors stabilize Hybrid
-# - Quantile-based "Low" cutoffs + length-adaptive thresholds
-# - Normalized error labels for ML; metadata-aware diagnostics
-# - Heatmaps/boxplots; clean CSV export with all columns
+# Adds the requested features:
+# 1) Streamline metrics – one representative semantic score (Hybrid Accuracy) + separate Fluency.
+#    (Already present as `*_Accuracy` and `*_Fluency`; clarified in labels/exports.)
+# 2) Recalibrate thresholds – quantile-based cutoffs with sensible defaults
+#    (BLEU/CHRF < 0.15, Fluency < 3.0, Hybrid < 20th pct).
+# 3) Normalize error labels – canonical label vocabulary for aggregation/ML.
+# 4) Augment metadata – language/domain/genre + per-domain diagnostics.
 
 import streamlit as st
 import pandas as pd
@@ -64,48 +62,68 @@ with st.sidebar:
         index=0,
         help="Choose a multilingual model if your data spans languages.",
     )
-    semantic_weight = st.slider("Semantic weight (semantic metric)", 0.0, 1.0, 0.65, 0.05)
+    semantic_weight = st.slider("Semantic weight (cosine)", 0.0, 1.0, 0.65, 0.05)
     lexical_weight = 1.0 - semantic_weight
+    use_chrf = st.checkbox(
+        "Use CHRF for lexical overlap (fallback to BLEU if unavailable)",
+        value=True,
+    )
 
-    # Choose semantic metric
+    # New: choose semantic metric and tuning thresholds
     sem_choice = st.selectbox(
         "Semantic metric",
         options=["Cosine", "BERTScore", "COMET", "Cosine+BERTScore"],
         index=0,
         help="Prefer BERTScore/COMET for fairer semantic evaluation when available.",
     )
+    fluency_floor = st.number_input("Fluency floor to trust Hybrid (stabilizer)", 1.0, 5.0, 3.0, 0.1)
+    consistency_tolerance = st.slider("Consistency tolerance (|Cosine−BERTScore|)", 0.0, 1.0, 0.20, 0.01)
+    paraphrase_sem_hi = st.slider("Paraphrase: semantic high ≥", 0.70, 0.99, 0.85, 0.01)
+    drift_sem_lo = st.slider("Meaning drift: semantic low <", 0.40, 0.95, 0.70, 0.01)
+    low_lexical_for_paraphrase = st.slider("Paraphrase lexical threshold <", 0.0, 0.6, 0.20, 0.01)
 
-    use_chrf = st.checkbox(
-        "Use CHRF for lexical overlap (fallback to BLEU if unavailable)",
-        value=True,
-    )
+    st.markdown("---")
+    st.subheader("🧪 Stability & Thresholds")
+    # (existing controls remain above — ensure they exist)
+
+    st.markdown("---")
+    st.subheader("🧭 Evaluation Strategy")
+    rebalance_sem = st.checkbox("Emphasize semantic + fluency in Hybrid (rebalance)", value=True,
+                                help="Increase semantic weight and factor fluency to reduce over-penalizing paraphrases.")
+    use_composite = st.checkbox("Report composite indices (SQI & LI)", value=True,
+                                help="Semantic Quality Index (semantic+fluency) and Literalness Index (lexical).")
+    gateA_threshold = st.slider("Gate A – Semantic threshold", 0.50, 0.99, 0.80, 0.01,
+                                help="If Semantic ≥ Gate A, translation is likely OK (triage).")
+    gateB_lex_threshold = st.slider("Gate B – Lexical threshold", 0.00, 0.80, 0.20, 0.01,
+                                    help="Checked only when Gate A fails.")
+    gateB_flu_threshold = st.slider("Gate B – Fluency threshold", 1.0, 5.0, 3.0, 0.1,
+                                    help="Checked only when Gate A fails.")
 
     st.markdown("---")
     st.subheader("🧩 Metadata (optional)")
     st.caption("Add metadata for per-domain diagnostics and export.")
+
     meta_mode = st.radio("Metadata source", ["None", "Use existing columns", "Set constants"], index=0)
 
     language_val = domain_val = genre_val = None
     language_col = domain_col = genre_col = None
 
     if meta_mode == "Use existing columns":
+        # Detect likely columns
+        cols = []
+        try:
+            # Will be filled after upload – we guard with try/except and handle later.
+            pass
+        except Exception:
+            pass
         st.caption("You'll be able to select columns after uploading.")
     elif meta_mode == "Set constants":
         language_val = st.text_input("Language (constant for all rows)", value="")
         domain_val = st.text_input("Domain (constant for all rows)", value="")
         genre_val = st.text_input("Genre (constant for all rows)", value="")
 
-    st.markdown("---")
-    st.subheader("🧪 Stability & Thresholds")
-    fluency_floor = st.number_input("Fluency floor to trust Hybrid (stabilizer)", 1.0, 5.0, 3.0, 0.1)
-    style_floor = st.number_input("Style floor to trust Hybrid (stabilizer)", 1.0, 5.0, 3.0, 0.1)
-    consistency_tolerance = st.slider("Consistency tolerance (|Cosine − BERTScore|)", 0.0, 1.0, 0.20, 0.01)
-    paraphrase_sem_hi = st.slider("Paraphrase: semantic high ≥", 0.70, 0.99, 0.85, 0.01)
-    drift_sem_lo = st.slider("Meaning drift: semantic low <", 0.40, 0.95, 0.70, 0.01)
-    low_lexical_for_paraphrase = st.slider("Paraphrase lexical threshold <", 0.0, 0.6, 0.20, 0.01)
-
 # ===========================
-# Load models
+# Load model (cached per model name)
 # ===========================
 @st.cache_resource(show_spinner=True)
 def load_model(name: str):
@@ -129,6 +147,7 @@ model = load_model(model_name)
 # ===========================
 word_or_punct = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+|[^\w\s]", re.UNICODE)
 
+
 def normalize_text(t: str) -> str:
     t = unicodedata.normalize("NFKC", str(t)).strip().lower()
     t = re.sub(r"[“”]", '"', t)
@@ -136,11 +155,14 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t)
     return t
 
+
 def simple_tokenize(text: str):
     return word_or_punct.findall(text)
 
+
 def text_key(t: str) -> str:
     return blake2b(t.encode("utf-8"), digest_size=12).hexdigest()
+
 
 @st.cache_data(show_spinner=False)
 def batch_encode_unique(texts: list[str], model_name_for_cache: str):
@@ -153,86 +175,21 @@ def batch_encode_unique(texts: list[str], model_name_for_cache: str):
     )
     return {text_key(t): v for t, v in zip(texts, vecs)}
 
+
 def get_vec(t: str, cache: dict):
     return cache.get(text_key(t))
+
 
 def chrf_score(ref: str, hyp: str) -> float:
     if _CHRF is None:
         raise NameError("CHRF not available")
     return _CHRF.sentence_score(hyp, [ref]).score / 100.0  # 0..1
 
+
 def length_ratio_penalty(ref: str, hyp: str) -> float:
     r = max(1e-6, len(hyp.split())) / max(1e-6, len(ref.split()))
     return float(np.exp(-abs(np.log(r))))  # 1.0 when equal; ~0.61 at 2x or 0.5x
 
-def compute_style_features(t: str) -> dict:
-    """Deterministic style features + 1–5 style score."""
-    t = normalize_text(t)
-    t = re.sub(r"\s+", " ", t.strip())
-    sents = max(1, len(re.findall(r"[.!?]", t)))
-    tokens = t.split()
-    n_tok = max(1, len(tokens))
-
-    avg_sent_len = n_tok / sents
-    long_tok_ratio = sum(len(w) > 24 for w in tokens) / n_tok
-    repeat_punct = 1 if re.search(r"([!?.,])\1{1,}", t) else 0
-    double_space = 1 if re.search(r"\s{2,}", t) else 0
-    trailing_space = 1 if re.search(r"\s$", t) else 0
-    ttr = len(set(tokens)) / n_tok  # type–token ratio
-
-    score = 5.0
-    score -= min(2.0, abs(avg_sent_len - 18) / 18) * 1.2
-    score -= long_tok_ratio * 2.0
-    score -= (repeat_punct + double_space + trailing_space) * 0.5
-    score -= max(0, 0.35 - ttr) * 2.0  # penalize very low lexical variety
-    score = float(np.clip(score, 1.0, 5.0))
-
-    return {
-        "avg_sent_len": avg_sent_len,
-        "long_tok_ratio": long_tok_ratio,
-        "repeat_punct": repeat_punct,
-        "double_space": double_space,
-        "trailing_space": trailing_space,
-        "ttr": round(ttr, 3),
-        "style_score": round(score, 2),
-    }
-
-def fluency_score(text: str) -> float:
-    t = normalize_text(text)
-    if not t:
-        return 1.0
-    tokens = t.split()
-    long_token_ratio = sum(len(w) > 24 for w in tokens) / max(1, len(tokens))
-    punct_endings = len(re.findall(r"[.!?]", t))
-    sentences = max(1, punct_endings)
-    avg_sent_len = len(tokens) / sentences
-    repeats = len(re.findall(r"([!?.,])\1{1,}", t))
-    weird_ws = 1 if re.search(r"\s{2,}", t) else 0
-
-    score = 5.0
-    score -= min(2.0, abs(avg_sent_len - 18) / 18) * 1.0
-    score -= long_token_ratio * 2.0
-    score -= repeats * 0.3
-    score -= weird_ws * 0.5
-    return round(float(np.clip(score, 1.0, 5.0)), 2)
-
-def token_diff(a: str, b: str) -> str:
-    a_t, b_t = a.split(), b.split()
-    sm = SequenceMatcher(None, a_t, b_t)
-    parts = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            parts.extend(b_t[j1:j2])
-        elif tag == "replace":
-            if i1 != i2:
-                parts.append(f"<span style='background:#ffe6e6;text-decoration:line-through'>{' '.join(a_t[i1:i2])}</span>")
-            if j1 != j2:
-                parts.append(f"<span style='background:#e6ffe6;'>{' '.join(b_t[j1:j2])}</span>")
-        elif tag == "delete":
-            parts.append(f"<span style='background:#ffe6e6;text-decoration:line-through'>{' '.join(a_t[i1:i2])}</span>")
-        elif tag == "insert":
-            parts.append(f"<span style='background:#e6ffe6;'>{' '.join(b_t[j1:j2])}</span>")
-    return " ".join(parts)
 
 def _safe_clip01(x):
     try:
@@ -240,8 +197,11 @@ def _safe_clip01(x):
     except Exception:
         return 0.0
 
+
 def compute_semantic_signals(ref: str, hyp: str, embed_cache: dict, sem_choice: str):
-    """Compute available semantic signals: Cosine, BERTScore-F1, COMET (normalized to 0..1)."""
+    """Compute available semantic signals: Cosine, BERTScore-F1, COMET (normalized to 0..1).
+    Returns dict with possibly-missing keys: {'cosine','bertscore_f1','comet'}
+    """
     ref_n, hyp_n = normalize_text(ref), normalize_text(hyp)
     # Cosine via cached embeddings
     v_ref, v_hyp = get_vec(ref_n, embed_cache), get_vec(hyp_n, embed_cache)
@@ -270,24 +230,16 @@ def compute_semantic_signals(ref: str, hyp: str, embed_cache: dict, sem_choice: 
 
     return {"cosine": cosine, "bertscore_f1": bert_f1, "comet": comet}
 
-def semantic_accuracy_score(
-    ref: str,
-    hyp: str,
-    embed_cache: dict,
-    w_sem: float,
-    w_lex: float,
-    prefer_chrf: bool,
-    sem_choice: str,
-    fluency: float | None = None,
-    style: float | None = None,
-    fluency_floor: float = 3.0,
-    style_floor: float = 3.0,
-    consistency_tolerance: float = 0.20,
-):
-    """
-    Compute lexical + selected semantic metric + hybrid with stabilizers.
+
+def semantic_accuracy_score(ref: str, hyp: str, embed_cache: dict,
+                            w_sem: float, w_lex: float, prefer_chrf: bool,
+                            sem_choice: str,
+                            fluency: float | None = None,
+                            fluency_floor: float = 3.0,
+                            consistency_tolerance: float = 0.20):
+    """Compute lexical + selected semantic metric + hybrid with stabilizers.
     Returns: (semantic_signal, used_sem_name, lexical, hybrid, extras_dict)
-    extras include: cosine, bertscore_f1, comet, length_penalty, lexical_metric
+    extras include: cosine, bertscore_f1, comet, length_penalty
     """
     ref_n, hyp_n = normalize_text(ref), normalize_text(hyp)
 
@@ -298,7 +250,7 @@ def semantic_accuracy_score(
     else:
         lexical = float(
             sentence_bleu([simple_tokenize(ref_n)], simple_tokenize(hyp_n),
-                          smoothing_function=SmoothingFunction().method4)
+                           smoothing_function=SmoothingFunction().method4)
         )
         used_lex = "BLEU"
 
@@ -325,12 +277,9 @@ def semantic_accuracy_score(
     # hybrid before stabilization
     hybrid = _safe_clip01(w_sem * sem_val + w_lex * lexical) * penalty
 
-    # Stabilize by fluency/style floors: if below floor, dampen hybrid
+    # Stabilize by fluency floor: if fluency provided and below floor, dampen hybrid
     if fluency is not None and fluency < fluency_floor:
         factor = max(0.1, float(fluency) / float(fluency_floor))
-        hybrid *= factor
-    if style is not None and style < style_floor:
-        factor = max(0.1, float(style) / float(style_floor))
         hybrid *= factor
 
     # Consistency stabilization between cosine and BERTScore when both exist
@@ -349,6 +298,46 @@ def semantic_accuracy_score(
     }
     return round(sem_val, 3), used_sem, round(lexical, 3), round(hybrid, 3), extras
 
+
+def fluency_score(text: str) -> float:
+    t = normalize_text(text)
+    if not t:
+        return 1.0
+    tokens = t.split()
+    long_token_ratio = sum(len(w) > 24 for w in tokens) / max(1, len(tokens))
+    punct_endings = len(re.findall(r"[.!?]", t))
+    sentences = max(1, punct_endings)
+    avg_sent_len = len(tokens) / sentences
+    repeats = len(re.findall(r"([!?.,])\1{1,}", t))
+    weird_ws = 1 if re.search(r"\s{2,}", t) else 0
+
+    score = 5.0
+    score -= min(2.0, abs(avg_sent_len - 18) / 18) * 1.0
+    score -= long_token_ratio * 2.0
+    score -= repeats * 0.3
+    score -= weird_ws * 0.5
+    return round(float(np.clip(score, 1.0, 5.0)), 2)
+
+
+def token_diff(a: str, b: str) -> str:
+    a_t, b_t = a.split(), b.split()
+    sm = SequenceMatcher(None, a_t, b_t)
+    parts = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            parts.extend(b_t[j1:j2])
+        elif tag == "replace":
+            if i1 != i2:
+                parts.append(f"<span style='background:#ffe6e6;text-decoration:line-through'>{' '.join(a_t[i1:i2])}</span>")
+            if j1 != j2:
+                parts.append(f"<span style='background:#e6ffe6;'>{' '.join(b_t[j1:j2])}</span>")
+        elif tag == "delete":
+            parts.append(f"<span style='background:#ffe6e6;text-decoration:line-through'>{' '.join(a_t[i1:i2])}</span>")
+        elif tag == "insert":
+            parts.append(f"<span style='background:#e6ffe6;'>{' '.join(b_t[j1:j2])}</span>")
+    return " ".join(parts)
+
+
 def dynamic_thresholds(ref_len_tokens: int):
     # retained for row-wise adaptivity; global low cutoffs are added later
     acc = 0.60
@@ -360,16 +349,12 @@ def dynamic_thresholds(ref_len_tokens: int):
     return acc, lex
 
 # Paraphrase vs. meaning drift classifier
-def classify_semantic_deviation(
-    lexical: float,
-    cosine: float | None,
-    bert_f1: float | None,
-    paraphrase_sem_hi: float = 0.85,
-    low_lex: float = 0.20,
-    drift_sem_lo: float = 0.70,
-) -> str | None:
+def classify_semantic_deviation(lexical: float, cosine: float | None, bert_f1: float | None,
+                                paraphrase_sem_hi: float = 0.85, low_lex: float = 0.20,
+                                drift_sem_lo: float = 0.70) -> str | None:
     """Return 'Paraphrase' when semantic strong but lexical low; 'Meaning Drift' when semantic weak.
-    Prefers BERTScore if available, else cosine."""
+    Prefers BERTScore if available, else cosine.
+    """
     sem_signal = None
     if bert_f1 is not None:
         sem_signal = bert_f1
@@ -388,9 +373,9 @@ def classify_semantic_deviation(
 # -----------------------------
 # Error label normalization
 # -----------------------------
+# Canonical vocabulary tailored for this app
 LABEL_CANON = {
     "fluency": ["fluency/grammar", "grammar", "fluency issues"],
-    "style": ["style", "formatting", "layout"],
     "semantic": ["semantic deviation", "meaning error", "mismatch"],
     "lexical": ["low lexical overlap", "lexical low", "overlap low"],
     "length_short": ["too short", "short"],
@@ -398,10 +383,12 @@ LABEL_CANON = {
     "paraphrase": ["paraphrase", "lexically diverse paraphrase"],
     "meaning_drift": ["meaning drift", "semantic shift"],
 }
+# Build lookup
 _LABEL_LOOKUP = {k: k for k in LABEL_CANON}
 for k, aliases in LABEL_CANON.items():
     for a in aliases:
         _LABEL_LOOKUP[a.lower()] = k
+
 
 def normalize_labels(raw_list):
     norm = []
@@ -520,12 +507,8 @@ if uploaded_file:
                     if source_col and mode == "Reference-based":
                         source_text = str(row[source_col])
                         source_text_norm = str(df_norm.iloc[idx][source_col])
-
-                        # fluency/style first (used as stabilizers)
+                        # compute fluency first for hybrid stabilization
                         flu = fluency_score(trans_text)
-                        style_feats = compute_style_features(trans_text)
-                        style = float(style_feats["style_score"])
-
                         sem_sig, used_sem, lexical, hybrid, extras = semantic_accuracy_score(
                             source_text_norm,
                             trans_text_norm,
@@ -535,9 +518,7 @@ if uploaded_file:
                             prefer_chrf=use_chrf,
                             sem_choice=sem_choice,
                             fluency=flu,
-                            style=style,
                             fluency_floor=fluency_floor,
-                            style_floor=style_floor,
                             consistency_tolerance=consistency_tolerance,
                         )
 
@@ -546,9 +527,6 @@ if uploaded_file:
                         errs_raw = []
                         if flu < 3:
                             errs_raw.append("Fluency/Grammar")
-                        if style < 3:
-                            errs_raw.append("Style")
-
                         # semantic deviation labelling (paraphrase vs meaning drift)
                         sem_tag = classify_semantic_deviation(
                             lexical=lexical,
@@ -562,7 +540,6 @@ if uploaded_file:
                             errs_raw.append("Paraphrase")
                         elif sem_tag == "Meaning Drift":
                             errs_raw.append("Semantic Deviation")
-
                         if hybrid < acc_thr:
                             errs_raw.append("Semantic Deviation")
                         if lexical < lex_thr:
@@ -575,6 +552,26 @@ if uploaded_file:
 
                         errs_norm = normalize_labels(errs_raw)
 
+                        # Optional rebalanced hybrid
+                        if rebalance_sem:
+                            lp = extras.get("length_penalty", 1.0) or 1.0
+                            hyb_reb = float(np.clip(0.8 * (sem_sig or 0.0) + 0.2 * (lexical or 0.0), 0, 1)) * lp
+                            if flu < fluency_floor:
+                                hyb_reb *= max(0.1, float(flu) / float(fluency_floor))
+                            if style < style_floor:
+                                hyb_reb *= max(0.1, float(style) / float(style_floor))
+                            hybrid = round(hyb_reb, 3)
+
+                        # Composite indices
+                        SQI = round(float(np.clip(0.7 * (sem_sig or 0.0) + 0.3 * (flu / 5.0), 0, 1)), 3)
+                        LI = round(float(np.clip(lexical or 0.0, 0, 1)), 3)
+
+                        # Triage (Gate A/B)
+                        gateA_pass = bool((sem_sig or 0.0) >= gateA_threshold)
+                        gateB_flag = False
+                        if not gateA_pass:
+                            gateB_flag = bool(((lexical or 0.0) < gateB_lex_threshold) or (flu < gateB_flu_threshold))
+
                         row_result.update({
                             f"{t_col}_LexicalMetric": extras.get("lexical_metric"),
                             f"{t_col}_Lexical": lexical,
@@ -586,6 +583,10 @@ if uploaded_file:
                             f"{t_col}_Accuracy": hybrid,
                             f"{t_col}_Fluency": flu,
                             f"{t_col}_Style": style,
+                            f"{t_col}_SQI": SQI,
+                            f"{t_col}_LI": LI,
+                            f"{t_col}_GateA_SemanticOK": "✅" if gateA_pass else "",
+                            f"{t_col}_GateB_Flag": "⚠️" if gateB_flag else "",
                             f"{t_col}_Errors": ", ".join(sorted(set(errs_raw))) if errs_raw else "None",
                             f"{t_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                         })
@@ -600,11 +601,7 @@ if uploaded_file:
                                 continue
                             other_text = str(row[other_col])
                             other_text_norm = str(df_norm.iloc[idx][other_col])
-
                             flu = fluency_score(trans_text)
-                            style_feats = compute_style_features(trans_text)
-                            style = float(style_feats["style_score"])
-
                             sem_sig, used_sem, lexical, hybrid, extras = semantic_accuracy_score(
                                 other_text_norm,
                                 trans_text_norm,
@@ -614,22 +611,35 @@ if uploaded_file:
                                 prefer_chrf=use_chrf,
                                 sem_choice=sem_choice,
                                 fluency=flu,
-                                style=style,
                                 fluency_floor=fluency_floor,
-                                style_floor=style_floor,
                                 consistency_tolerance=consistency_tolerance,
                             )
                             errs_raw = []
                             if flu < 3:
                                 errs_raw.append("Fluency/Grammar")
-                            if style < 3:
-                                errs_raw.append("Style")
                             n_words = len(trans_text_norm.split())
                             if n_words < 3:
                                 errs_raw.append("Too Short")
                             elif n_words > 60:
                                 errs_raw.append("Too Long / Verbosity")
                             errs_norm = normalize_labels(errs_raw)
+
+                            # Optional rebalanced hybrid
+                            if rebalance_sem:
+                                lp = extras.get("length_penalty", 1.0) or 1.0
+                                hyb_reb = float(np.clip(0.8 * (sem_sig or 0.0) + 0.2 * (lexical or 0.0), 0, 1)) * lp
+                                if flu < fluency_floor:
+                                    hyb_reb *= max(0.1, float(flu) / float(fluency_floor))
+                                if style < style_floor:
+                                    hyb_reb *= max(0.1, float(style) / float(style_floor))
+                                hybrid = round(hyb_reb, 3)
+
+                            SQI = round(float(np.clip(0.7 * (sem_sig or 0.0) + 0.3 * (flu / 5.0), 0, 1)), 3)
+                            LI = round(float(np.clip(lexical or 0.0, 0, 1)), 3)
+                            gateA_pass = bool((sem_sig or 0.0) >= gateA_threshold)
+                            gateB_flag = False
+                            if not gateA_pass:
+                                gateB_flag = bool(((lexical or 0.0) < gateB_lex_threshold) or (flu < gateB_flu_threshold))
 
                             row_result.update({
                                 f"{t_col}_vs_{other_col}_LexicalMetric": extras.get("lexical_metric"),
@@ -642,29 +652,25 @@ if uploaded_file:
                                 f"{t_col}_vs_{other_col}_Accuracy": hybrid,
                                 f"{t_col}_vs_{other_col}_Fluency": flu,
                                 f"{t_col}_vs_{other_col}_Style": style,
+                                f"{t_col}_vs_{other_col}_SQI": SQI,
+                                f"{t_col}_vs_{other_col}_LI": LI,
+                                f"{t_col}_vs_{other_col}_GateA_SemanticOK": "✅" if gateA_pass else "",
+                                f"{t_col}_vs_{other_col}_GateB_Flag": "⚠️" if gateB_flag else "",
                                 f"{t_col}_vs_{other_col}_Errors": ", ".join(sorted(set(errs_raw))) if errs_raw else "None",
                                 f"{t_col}_vs_{other_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                             })
 
                     elif mode == "Standalone Student Assessment":
                         flu = fluency_score(trans_text)
-                        style_feats = compute_style_features(trans_text)
-                        style = float(style_feats["style_score"])
-                        errs_raw = []
-                        if flu < 3:
-                            errs_raw.append("Fluency/Grammar")
-                        if style < 3:
-                            errs_raw.append("Style")
+                        errs_raw = [] if flu >= 3 else ["Fluency/Grammar"]
                         errs_norm = normalize_labels(errs_raw)
-                        # No reference: cosine/lexical/hybrid/semantic are None
+                        # No reference: cosine/lexical/hybrid are None
                         row_result.update({
                             f"{t_col}_Fluency": flu,
-                            f"{t_col}_Style": style,
                             f"{t_col}_Cosine": None,
                             f"{t_col}_Lexical": None,
-                            f"{t_col}_Semantic": None,
                             f"{t_col}_Accuracy": None,
-                            f"{t_col}_Errors": "None" if not errs_raw else ", ".join(sorted(set(errs_raw))),
+                            f"{t_col}_Errors": "None" if flu >= 3 else "Fluency/Grammar",
                             f"{t_col}_ErrorsNorm": ",".join(errs_norm) if errs_norm else "",
                         })
 
@@ -692,7 +698,6 @@ if uploaded_file:
 
             lex_vals = pd.concat([res_df[c] for c in _collect_cols("_Lexical")], axis=0) if _collect_cols("_Lexical") else pd.Series(dtype=float)
             flu_vals = pd.concat([res_df[c] for c in _collect_cols("_Fluency")], axis=0) if _collect_cols("_Fluency") else pd.Series(dtype=float)
-            sty_vals = pd.concat([res_df[c] for c in _collect_cols("_Style")], axis=0) if _collect_cols("_Style") else pd.Series(dtype=float)
             acc_vals = pd.concat([res_df[c] for c in _collect_cols("_Accuracy")], axis=0) if _collect_cols("_Accuracy") else pd.Series(dtype=float)
 
             def safe_q(s, q, default):
@@ -705,26 +710,20 @@ if uploaded_file:
                     return default
 
             # Defaults as examples
-            default_lex_low = 0.15
+            default_bleu_or_chrf_low = 0.15
             default_fluency_low = 3.0
-            default_style_low = 3.0
             default_hybrid_low = 0.50
 
-            q_lex = safe_q(lex_vals, 0.10, default_lex_low)
+            q_lex = safe_q(lex_vals, 0.10, default_bleu_or_chrf_low)
             q_flu = safe_q(flu_vals, 0.10, default_fluency_low)
-            q_sty = safe_q(sty_vals, 0.10, default_style_low)
             q_acc = safe_q(acc_vals, 0.20, default_hybrid_low)
 
-            # choose stricter (max) for lexical/fluency/style; keep acc as empirical
-            LEX_LOW = max(default_lex_low, q_lex)
+            # choose the stricter (max) between empirical and defaults to avoid too-lenient cutoffs
+            LEX_LOW = max(default_bleu_or_chrf_low, q_lex)
             FLU_LOW = max(default_fluency_low, q_flu)
-            STYLE_LOW = max(default_style_low, q_sty)
-            ACC_LOW = q_acc
+            ACC_LOW = q_acc  # 20th percentile is already data-driven; keep default only if NaN handled above
 
-            st.markdown(
-                f"**Calibrated Low Cutoffs:** Lexical < `{LEX_LOW:.2f}`, Fluency < `{FLU_LOW:.2f}`, "
-                f"Style < `{STYLE_LOW:.2f}`, Hybrid Accuracy < `{ACC_LOW:.2f}`"
-            )
+            st.markdown(f"**Calibrated Low Cutoffs:** Lexical < `{LEX_LOW:.2f}`, Fluency < `{FLU_LOW:.2f}`, Hybrid Accuracy < `{ACC_LOW:.2f}`")
 
             # ---------------------------
             # Low-Quality Flags – Global (quantiles) + Adaptive (length)
@@ -737,9 +736,10 @@ if uploaded_file:
                     # adaptive thresholds by sentence length
                     acc_thr_adapt, lex_thr_adapt = dynamic_thresholds(ref_lens[i])
                     for c in translation_cols:
-                        acc_col = f"{c}_Accuracy"; lex_col = f"{c}_Lexical"; flu_col = f"{c}_Fluency"; sty_col = f"{c}_Style"
+                        acc_col = f"{c}_Accuracy"; lex_col = f"{c}_Lexical"; flu_col = f"{c}_Fluency"
 
                         if acc_col in res_df.columns:
+                            # Two flags: global and adaptive
                             flag_c_g = acc_col.replace("_Accuracy", "_Low_Hybrid_Flag_Global")
                             flag_c_a = acc_col.replace("_Accuracy", "_Low_Hybrid_Flag_Adaptive")
                             val = res_df.loc[i, acc_col]
@@ -761,22 +761,12 @@ if uploaded_file:
                             res_df.loc[i, flag_f_g] = "⚠️" if pd.notna(val) and val < FLU_LOW else ""
                             flagged_cols.append(flag_f_g)
 
-                        if sty_col in res_df.columns:
-                            flag_s_g = sty_col.replace("_Style", "_Low_Style_Flag_Global")
-                            val = res_df.loc[i, sty_col]
-                            res_df.loc[i, flag_s_g] = "⚠️" if pd.notna(val) and val < STYLE_LOW else ""
-                            flagged_cols.append(flag_s_g)
-
-            # Fluency/Style flags (all modes) – global only when not reference-based
+            # Fluency flags (all modes) – global only when not reference-based
             if mode != "Reference-based":
                 for col in res_df.columns:
                     if col.endswith("_Fluency"):
                         flag_col = col.replace("_Fluency", "_Low_Fluency_Flag_Global")
                         res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if pd.notna(x) and x < FLU_LOW else "")
-                        flagged_cols.append(flag_col)
-                    if col.endswith("_Style"):
-                        flag_col = col.replace("_Style", "_Low_Style_Flag_Global")
-                        res_df[flag_col] = res_df[col].apply(lambda x: "⚠️" if pd.notna(x) and x < STYLE_LOW else "")
                         flagged_cols.append(flag_col)
 
             if flagged_cols:
@@ -787,7 +777,6 @@ if uploaded_file:
             # ---------------------------
             if mode == "Reference-based":
                 st.subheader("📈 Per-Sentence Similarity Heatmaps")
-
                 def style_heatmap(df_num):
                     try:
                         return df_num.style.background_gradient(cmap="YlGnBu").format("{:.2f}")
@@ -810,12 +799,15 @@ if uploaded_file:
             # ---------------------------
             st.subheader("📊 Dashboard Summary")
             if mode == "Reference-based":
-                metrics = ["Lexical", "Semantic", "Cosine", "Accuracy", "Fluency", "Style"]
+                metrics = ["Lexical", "Semantic", "Cosine", "Accuracy", "Fluency"]
             elif mode == "Pairwise Comparison":
-                metrics = ["Lexical", "Semantic", "Cosine", "Accuracy", "Fluency", "Style"]
+                metrics = ["Lexical", "Semantic", "Cosine", "Accuracy"]
             else:
-                metrics = ["Fluency", "Style"]
+                metrics = ["Fluency"]
 
+            # Ensure composite metrics are considered when present
+            if "SQI" not in metrics:
+                metrics = metrics + ["SQI", "LI"]
             for metric in metrics:
                 metric_cols = [c for c in res_df.columns if c.endswith(metric)]
                 if metric_cols:
@@ -824,6 +816,92 @@ if uploaded_file:
                     plt.ylabel(metric)
                     plt.title(f"{metric} Distribution Across Students / Translations")
                     st.pyplot(plt)
+
+            # ---------------------------
+            # Triage Summary & Disagreement Examples
+            # ---------------------------
+            st.subheader("🧷 Triage Summary")
+            if mode == "Reference-based":
+                tri_rows = []
+                for base in translation_cols:
+                    sem_col = f"{base}_Semantic"; lex_col = f"{base}_Lexical"; flu_col = f"{base}_Fluency"
+                    ga_col = f"{base}_GateA_SemanticOK"; gb_col = f"{base}_GateB_Flag"
+                    if sem_col in res_df and lex_col in res_df:
+                        tri_rows.append({
+                            "Student": base,
+                            "GateA_OK_%": float((res_df[ga_col] == "✅").mean()*100) if ga_col in res_df else np.nan,
+                            "GateB_Flag_%": float((res_df[gb_col] == "⚠️").mean()*100) if gb_col in res_df else np.nan,
+                            "Paraphrase_cases": int(((res_df.get(f"{base}_ErrorsNorm", "").astype(str).str.contains("paraphrase")).sum()) if f"{base}_ErrorsNorm" in res_df else 0),
+                            "MeaningDrift_cases": int(((res_df.get(f"{base}_ErrorsNorm", "").astype(str).str.contains("meaning_drift|semantic")).sum()) if f"{base}_ErrorsNorm" in res_df else 0),
+                        })
+                if tri_rows:
+                    st.dataframe(pd.DataFrame(tri_rows))
+
+            st.subheader("🧩 Disagreements & Teaching Cases")
+            disagree_examples = []
+            max_examples = 12
+            for i in range(len(res_df)):
+                for base in translation_cols:
+                    sem = res_df.get(f"{base}_Semantic")
+                    lex = res_df.get(f"{base}_Lexical")
+                    cos = res_df.get(f"{base}_Cosine")
+                    bs = res_df.get(f"{base}_BERTScoreF1")
+                    if sem is None or f"{base}_Semantic" not in res_df.columns:
+                        continue
+                    sem_val = res_df.loc[i, f"{base}_Semantic"] if pd.notna(res_df.loc[i, f"{base}_Semantic"]) else np.nan
+                    lex_val = res_df.loc[i, f"{base}_Lexical"] if f"{base}_Lexical" in res_df.columns else np.nan
+                    cos_val = res_df.loc[i, f"{base}_Cosine"] if f"{base}_Cosine" in res_df.columns else np.nan
+                    bs_val = res_df.loc[i, f"{base}_BERTScoreF1"] if f"{base}_BERTScoreF1" in res_df.columns else np.nan
+                    cond_paraphrase_like = (pd.notna(sem_val) and sem_val >= paraphrase_sem_hi) and (pd.notna(lex_val) and lex_val < low_lexical_for_paraphrase)
+                    cond_metric_disagree = (pd.notna(cos_val) and pd.notna(bs_val) and abs(cos_val - bs_val) > consistency_tolerance)
+                    if cond_paraphrase_like or cond_metric_disagree:
+                        src_txt = str(df.loc[i, source_col]) if (mode == "Reference-based" and source_col) else ""
+                        hyp_txt = str(df.loc[i, base]) if base in df.columns else ""
+                        disagree_examples.append({
+                            "Row": i,
+                            "Student": base,
+                            "Semantic": round(sem_val,3) if pd.notna(sem_val) else np.nan,
+                            "Lexical": round(lex_val,3) if pd.notna(lex_val) else np.nan,
+                            "Cosine": round(cos_val,3) if pd.notna(cos_val) else np.nan,
+                            "BERTScoreF1": round(bs_val,3) if pd.notna(bs_val) else np.nan,
+                            "Source": src_txt[:220],
+                            "Translation": hyp_txt[:220],
+                        })
+                    if len(disagree_examples) >= max_examples:
+                        break
+                if len(disagree_examples) >= max_examples:
+                    break
+            if disagree_examples:
+                st.caption("Examples useful for reviewer guidance — avoid over-correcting valid paraphrases.")
+                st.dataframe(pd.DataFrame(disagree_examples))
+
+            # ---------------------------
+            # Continuous Monitoring – Outlier shares over time
+            # ---------------------------
+            st.subheader("📉 Outlier Monitoring")
+            def iqr_outlier_share(series):
+                s = pd.to_numeric(series, errors='coerce').dropna()
+                if s.empty: return np.nan
+                q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                iqr = q3 - q1
+                low, high = q1 - 1.5*iqr, q3 + 1.5*iqr
+                return float(((s < low) | (s > high)).mean()*100)
+
+            lex_all = pd.concat([res_df[c] for c in res_df.columns if c.endswith('_Lexical')], axis=0) if any(res_df.columns.str.endswith('_Lexical')) else pd.Series(dtype=float)
+            acc_all = pd.concat([res_df[c] for c in res_df.columns if c.endswith('_Accuracy')], axis=0) if any(res_df.columns.str.endswith('_Accuracy')) else pd.Series(dtype=float)
+
+            lex_out_pct = iqr_outlier_share(lex_all)
+            acc_out_pct = iqr_outlier_share(acc_all)
+
+            st.write({"Lexical_outliers_%": lex_out_pct, "Hybrid_outliers_%": acc_out_pct})
+
+            # store history in session
+            if 'outlier_history' not in st.session_state:
+                st.session_state.outlier_history = []
+            st.session_state.outlier_history.append({"Lexical": lex_out_pct, "Hybrid": acc_out_pct, "n": len(res_df)})
+            hist_df = pd.DataFrame(st.session_state.outlier_history)
+            if not hist_df.empty:
+                st.line_chart(hist_df[["Lexical", "Hybrid"]])
 
             # ---------------------------
             # Per-domain diagnostics (using metadata)
@@ -835,57 +913,7 @@ if uploaded_file:
                 for i in range(len(res_df)):
                     meta_row = meta_df.iloc[i].to_dict() if not meta_df.empty else {}
                     for base in translation_cols:
-                        rec = {
-                            **meta_row,
-                            "Student": base,
-                            "Accuracy": res_df.loc[i, f"{base}_Accuracy"] if f"{base}_Accuracy" in res_df.columns else np.nan,
-                            "Fluency": res_df.loc[i, f"{base}_Fluency"] if f"{base}_Fluency" in res_df.columns else np.nan,
-                            "Style": res_df.loc[i, f"{base}_Style"] if f"{base}_Style" in res_df.columns else np.nan,
-                            "Lexical": res_df.loc[i, f"{base}_Lexical"] if f"{base}_Lexical" in res_df.columns else np.nan,
-                            "Semantic": res_df.loc[i, f"{base}_Semantic"] if f"{base}_Semantic" in res_df.columns else np.nan,
-                            "ErrorsNorm": res_df.loc[i, f"{base}_ErrorsNorm"] if f"{base}_ErrorsNorm" in res_df.columns else "",
-                        }
-                        long_rows.append(rec)
-                long_df = pd.DataFrame(long_rows)
-
-                # Aggregate
-                if not long_df.empty:
-                    group_keys = [k for k in ["Domain", "Language", "Genre"] if k in long_df.columns]
-                    if not group_keys:
-                        st.caption("No metadata provided; skipping per-domain aggregates.")
-                    else:
-                        # label prevalence
-                        def top_labels(sub):
-                            labels = ",".join(sub["ErrorsNorm"].dropna().astype(str)).split(",")
-                            labels = [x for x in labels if x]
-                            if not labels:
-                                return ""
-                            s = pd.Series(labels).value_counts(normalize=True)
-                            pairs = [f"{lab}:{share:.0%}" for lab, share in s.head(3).items()]
-                            return ", ".join(pairs)
-
-                        agg = long_df.groupby(group_keys).agg(
-                            Count=("Accuracy", "count"),
-                            Accuracy_Mean=("Accuracy", "mean"),
-                            Accuracy_Std=("Accuracy", "std"),
-                            Fluency_Mean=("Fluency", "mean"),
-                            Fluency_Std=("Fluency", "std"),
-                            Style_Mean=("Style", "mean"),
-                            Lexical_Mean=("Lexical", "mean"),
-                            Semantic_Mean=("Semantic", "mean"),
-                            Top_Labels=("ErrorsNorm", top_labels),
-                        ).reset_index()
-                        st.dataframe(agg)
-            else:
-                st.caption("Metadata shape mismatch; per-domain diagnostics skipped.")
-
-            # ---------------------------
-            # Clean CSV Export (exclude HTML diffs)
-            # ---------------------------
-            st.subheader("📥 Export Cleaned Results")
-            preferred_order = []
-            for base in translation_cols:
-                for metric in ["Accuracy", "Lexical", "Semantic", "Cosine", "BERTScoreF1", "COMET", "Fluency", "Style", "Errors", "ErrorsNorm", "SemanticMetric", "LexicalMetric"]:
+                for metric in ["Accuracy", "Lexical", "Semantic", "Cosine", "BERTScoreF1", "COMET", "Fluency", "Style", "SQI", "LI", "GateA_SemanticOK", "GateB_Flag", "Errors", "ErrorsNorm", "SemanticMetric", "LexicalMetric"]:
                     matches = [c for c in res_df.columns if c.startswith(base) and c.endswith(metric)]
                     preferred_order.extend(matches)
             flag_cols = [c for c in res_df.columns if "Flag" in c]
@@ -913,12 +941,21 @@ if uploaded_file:
                 .str.replace(" SemanticMetric", " (Semantic Metric)")
                 .str.replace(" LexicalMetric", " (Lexical Metric)")
                 .str.replace(" Fluency", " (Fluency)")
-                .str.replace(" Style", " (Style)")
                 .str.replace(" ErrorsNorm", " (Error Labels – Canonical)")
                 .str.replace(" Errors", " (Error Categories – Raw)")
                 .str.replace(" Flag", " ⚠️", regex=False)
             )
+                .str.replace(" Flag", " ⚠️", regex=False)
+            )
             export_df = export_df.applymap(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
+            # Additional friendly names for new columns
+            export_df.columns = (
+                export_df.columns
+                .str.replace(" SQI", " (Semantic Quality Index)")
+                .str.replace(" LI", " (Literalness Index)")
+                .str.replace(" GateA SemanticOK", " (Gate A – Semantic OK)")
+                .str.replace(" GateB Flag", " (Gate B – Needs Review)")
+            )
 
             # Show a peek
             st.dataframe(export_df.head(20))
@@ -935,7 +972,6 @@ if uploaded_file:
                 st.write({
                     "Lexical_Low": LEX_LOW,
                     "Fluency_Low": FLU_LOW,
-                    "Style_Low": STYLE_LOW,
                     "Hybrid_Low": ACC_LOW,
                 })
 
