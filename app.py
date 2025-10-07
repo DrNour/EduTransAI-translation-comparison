@@ -946,8 +946,7 @@ if uploaded_file:
                 .str.replace(" Flag", " ⚠️", regex=False)
             )
                 .str.replace(" Flag", " ⚠️", regex=False)
-            )
-            export_df = export_df.applymap(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
+                        export_df = export_df.applymap(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
             # Additional friendly names for new columns
             export_df.columns = (
                 export_df.columns
