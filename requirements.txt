@@ -2,12 +2,12 @@
 streamlit
 pandas
 numpy
+openpyxl
 
 # NLP & metrics
 sentence-transformers
 sacrebleu
 nltk
-openpyxl
 
 # Semantic metrics (optional but recommended)
 bert-score
