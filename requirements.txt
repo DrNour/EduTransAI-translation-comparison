@@ -7,7 +7,7 @@ numpy
 sentence-transformers
 sacrebleu
 nltk
-openpyxl'
+openpyxl
 
 # Semantic metrics (optional but recommended)
 bert-score
