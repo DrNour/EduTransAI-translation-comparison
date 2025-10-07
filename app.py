@@ -401,6 +401,76 @@ def normalize_labels(raw_list):
             out.append(x); seen.add(x)
     return out
 
+# ---------------------------
+# Human-readable column names (robust, order-safe) + de-dup
+# ---------------------------
+def _pretty_metric_suffix(suffix: str) -> str:
+    # Exact matches first
+    mapping_exact = {
+        "Accuracy": " (Hybrid Accuracy)",
+        "Lexical": " (Lexical)",
+        "Semantic": " (Semantic Score)",
+        "Cosine": " (Semantic Cosine)",
+        "BERTScoreF1": " (BERTScore F1)",
+        "Fluency": " (Fluency)",
+        "Style": " (Style)",
+        "SQI": " (Semantic Quality Index)",
+        "LI": " (Literalness Index)",
+        "Errors": " (Error Categories – Raw)",
+        "ErrorsNorm": " (Error Labels – Canonical)",
+        "SemanticMetric": " (Semantic Metric)",
+        "LexicalMetric": " (Lexical Metric)",
+        "GateA_SemanticOK": " (Gate A – Semantic OK)",
+        "GateB_Flag": " (Gate B – Needs Review)",
+    }
+    if suffix in mapping_exact:
+        return mapping_exact[suffix]
+
+    # Low flags / patterns
+    if suffix == "Low_Hybrid_Flag_Global":
+        return " Low Hybrid ⚠️ Global"
+    if suffix == "Low_Hybrid_Flag_Adaptive":
+        return " Low Hybrid ⚠️ Adaptive"
+    if suffix == "Low_Lexical_Flag_Global":
+        return " Low (Lexical) ⚠️ Global"
+    if suffix == "Low_Lexical_Flag_Adaptive":
+        return " Low (Lexical) ⚠️ Adaptive"
+    if suffix == "Low_Fluency_Flag_Global":
+        return " Low (Fluency) ⚠️ Global"
+    if suffix == "Low_Style_Flag_Global":
+        return " Low (Style) ⚠️ Global"
+
+    # Fallback: show raw suffix with spaces
+    return " " + suffix.replace("_", " ")
+
+def humanize_export_columns(cols) -> list:
+    """Map technical column names like 'Google Translate_Accuracy'
+    to 'Google Translate (Hybrid Accuracy)' in a collision-free way."""
+    out = []
+    seen = set()
+    for col in cols:
+        # Keep metadata columns as-is
+        if isinstance(col, str) and col in {"Language", "Domain", "Genre"}:
+            new = col
+        elif isinstance(col, str) and "_" in col:
+            # Split only on the FIRST underscore to keep pairwise labels intact:
+            # e.g., "A_vs_B_Accuracy" -> base="A_vs_B", suffix="Accuracy"
+            base, suffix = col.split("_", 1)
+            base_pretty = base.replace("_vs_", " vs ")
+            new = base_pretty + _pretty_metric_suffix(suffix)
+        else:
+            new = col
+
+        # Ensure uniqueness
+        candidate = new
+        k = 2
+        while candidate in seen:
+            candidate = f"{new} #{k}"
+            k += 1
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
 # ===========================
 # File upload
 # ===========================
@@ -701,6 +771,8 @@ if uploaded_file:
                 results.append(row_result)
 
             res_df = pd.DataFrame(results)
+
+            # Build metadata DataFrame
             meta_rows = []
             if meta_mode != "None":
                 for i in range(len(res_df)):
@@ -828,14 +900,17 @@ if uploaded_file:
                 for base in translation_cols:
                     ga_col = f"{base}_GateA_SemanticOK"
                     gb_col = f"{base}_GateB_Flag"
+                    par_col = f"{base}_ErrorsNorm"
+                    ga_ok_pct = float((res_df[ga_col] == "✅").mean() * 100) if ga_col in res_df.columns else np.nan
+                    gb_flag_pct = float((res_df[gb_col] == "⚠️").mean() * 100) if gb_col in res_df.columns else np.nan
+                    paraphrase_cases = int(res_df[par_col].astype(str).str.contains("paraphrase").sum()) if par_col in res_df.columns else 0
+                    drift_cases = int(res_df[par_col].astype(str).str.contains("meaning_drift|semantic").sum()) if par_col in res_df.columns else 0
                     tri_rows.append({
                         "Student": base,
-                        "GateA_OK_%": float((res_df.get(ga_col, pd.Series([""])) == "✅").mean() * 100) if ga_col in res_df else np.nan,
-                        "GateB_Flag_%": float((res_df.get(gb_col, pd.Series([""])) == "⚠️").mean() * 100) if gb_col in res_df else np.nan,
-                        "Paraphrase_cases": int(res_df.get(f"{base}_ErrorsNorm", pd.Series([""])).astype(str).str.contains("paraphrase").sum())
-                            if f"{base}_ErrorsNorm" in res_df else 0,
-                        "MeaningDrift_cases": int(res_df.get(f"{base}_ErrorsNorm", pd.Series([""])).astype(str).str.contains("meaning_drift|semantic").sum())
-                            if f"{base}_ErrorsNorm" in res_df else 0,
+                        "GateA_OK_%": ga_ok_pct,
+                        "GateB_Flag_%": gb_flag_pct,
+                        "Paraphrase_cases": paraphrase_cases,
+                        "MeaningDrift_cases": drift_cases,
                     })
                 st.dataframe(pd.DataFrame(tri_rows))
 
@@ -1011,12 +1086,17 @@ if uploaded_file:
                     "Fluency", "Style", "SQI", "LI", "GateA_SemanticOK", "GateB_Flag",
                     "Errors", "ErrorsNorm", "SemanticMetric", "LexicalMetric"
                 ]:
-                    matches = [c for c in res_df.columns if c.startswith(base) and c.endswith(metric)]
+                    matches = [c for c in res_df.columns if c.startswith(base + "_") and c.endswith(metric)]
                     preferred_order.extend(matches)
-            flag_cols = [c for c in res_df.columns if "Flag" in c]
+
+            # Only add flag columns that are NOT already in preferred_order (prevents duplicates)
+            flag_cols = [c for c in res_df.columns if ("Flag" in c) and (c not in preferred_order)]
+
             if "Best_Translation" in res_df.columns:
                 preferred_order = ["Best_Translation"] + preferred_order
+
             preferred_order.extend(flag_cols)
+
             other_cols = [c for c in res_df.columns if c not in preferred_order]
             ordered_cols = preferred_order + other_cols
 
@@ -1024,26 +1104,10 @@ if uploaded_file:
             if not meta_df.empty:
                 export_df = pd.concat([meta_df, export_df], axis=1)
 
-            export_df.columns = (
-                export_df.columns
-                .str.replace("_", " ")
-                .str.replace(" Lexical", " (Lexical)")
-                .str.replace(" Semantic", " (Semantic Score)")
-                .str.replace(" Accuracy", " (Hybrid Accuracy)")
-                .str.replace(" Cosine", " (Semantic Cosine)")
-                .str.replace(" BERTScoreF1", " (BERTScore F1)")
-                .str.replace(" SemanticMetric", " (Semantic Metric)")
-                .str.replace(" LexicalMetric", " (Lexical Metric)")
-                .str.replace(" Fluency", " (Fluency)")
-                .str.replace(" Style", " (Style)")
-                .str.replace(" SQI", " (Semantic Quality Index)")
-                .str.replace(" LI", " (Literalness Index)")
-                .str.replace(" ErrorsNorm", " (Error Labels – Canonical)")
-                .str.replace(" Errors", " (Error Categories – Raw)")
-                .str.replace(" GateA SemanticOK", " (Gate A – Semantic OK)")
-                .str.replace(" GateB Flag", " (Gate B – Needs Review)")
-                .str.replace(" Flag", " ⚠️", regex=False)
-            )
+            # Human-readable, collision-safe column names
+            export_df.columns = humanize_export_columns(export_df.columns)
+
+            # Round numeric values
             export_df = export_df.applymap(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
 
             st.dataframe(export_df.head(20))
