@@ -913,6 +913,7 @@ if uploaded_file:
                 for i in range(len(res_df)):
                     meta_row = meta_df.iloc[i].to_dict() if not meta_df.empty else {}
                     for base in translation_cols:
+                        
                 for metric in ["Accuracy", "Lexical", "Semantic", "Cosine", "BERTScoreF1", "COMET", "Fluency", "Style", "SQI", "LI", "GateA_SemanticOK", "GateB_Flag", "Errors", "ErrorsNorm", "SemanticMetric", "LexicalMetric"]:
                     matches = [c for c in res_df.columns if c.startswith(base) and c.endswith(metric)]
                     preferred_order.extend(matches)
