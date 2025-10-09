@@ -1,7 +1,7 @@
             # ---------------------------
             # Quantile-based global thresholds (recalibration)
             # ---------------------------
-            def _collect_cols(suffix):
+           def _collect_cols(suffix):
                 return [c for c in res_df.columns if c.endswith(suffix)]
 
             lex_vals = pd.concat([res_df[c] for c in _collect_cols("_Lexical")], axis=0) if _collect_cols("_Lexical") else pd.Series(dtype=float)
