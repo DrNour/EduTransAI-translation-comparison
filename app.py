@@ -983,8 +983,48 @@ try:
     if mode == "Reference-based":
         acc_cols = [f"{unit['prefix']}_Accuracy" for unit in analysis_units if f"{unit['prefix']}_Accuracy" in res_df.columns]
         if acc_cols:
-            best_series = res_df[acc_cols].idxmax(axis=1)
+            score_frame = res_df[acc_cols].apply(pd.to_numeric, errors="coerce")
+            best_series = score_frame.idxmax(axis=1)
             res_df["Best_Translation"] = best_series.str.replace("_Accuracy", "", regex=False)
+            if len(acc_cols) > 1:
+                sorted_scores = np.sort(score_frame.to_numpy(dtype=float), axis=1)
+                winning_margin = sorted_scores[:, -1] - sorted_scores[:, -2]
+                res_df["Winning_Margin"] = np.round(winning_margin, 3)
+                res_df["Comparison_Confidence"] = np.where(
+                    winning_margin >= 0.10,
+                    "Clear lead",
+                    np.where(winning_margin >= 0.03, "Moderate lead", "Close comparison"),
+                )
+                res_df["Human_Review_Recommended"] = winning_margin < 0.03
+
+            leaderboard_rows = []
+            for unit in analysis_units:
+                prefix = unit["prefix"]
+                acc_col = f"{prefix}_Accuracy"
+                if acc_col in res_df.columns:
+                    leaderboard_rows.append(
+                        {
+                            "Translation": unit["label"],
+                            "Mean Hybrid Score": round(float(pd.to_numeric(res_df[acc_col], errors="coerce").mean()), 3),
+                            "Mean Semantic Score": round(float(pd.to_numeric(res_df.get(f"{prefix}_Semantic"), errors="coerce").mean()), 3),
+                            "Mean Lexical Score": round(float(pd.to_numeric(res_df.get(f"{prefix}_Lexical"), errors="coerce").mean()), 3),
+                            "Mean Fluency": round(float(pd.to_numeric(res_df.get(f"{prefix}_Fluency"), errors="coerce").mean()), 2),
+                            "Mean Style": round(float(pd.to_numeric(res_df.get(f"{prefix}_Style"), errors="coerce").mean()), 2),
+                        }
+                    )
+            if leaderboard_rows:
+                leaderboard = pd.DataFrame(leaderboard_rows).sort_values(
+                    "Mean Hybrid Score", ascending=False, kind="stable"
+                )
+                leaderboard.insert(0, "Rank", range(1, len(leaderboard) + 1))
+                st.subheader("Translation Comparison Leaderboard")
+                st.caption("Scores support reviewer judgement; they do not replace expert assessment.")
+                st.dataframe(leaderboard, use_container_width=True, hide_index=True)
+                if len(acc_cols) > 1:
+                    close_count = int(res_df["Human_Review_Recommended"].sum())
+                    st.info(
+                        f"{close_count} of {len(res_df)} rows are close comparisons and should be reviewed by a human assessor."
+                    )
 
     st.dataframe(res_df.head(20))
 
